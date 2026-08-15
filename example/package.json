@@ -1,0 +1,12 @@
+{
+  "name": "repro-example-shop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A tiny shop with a real checkout bug, used to exercise repro end to end.",
+  "scripts": {
+    "dev": "node server.mjs --port 3100",
+    "db:reset": "node scripts/reset.mjs",
+    "seed": "node scripts/seed.mjs"
+  }
+}

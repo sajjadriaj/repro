@@ -1,0 +1,9 @@
+/** Library surface, for embedding repro in a harness or CI job. */
+export * from './spec.js'
+export * from './run.js'
+export * from './minimize.js'
+export * from './explain.js'
+export * from './compile.js'
+export * from './bisect.js'
+export { newRunDir, type NetworkEntry, type RunDir } from './evidence.js'
+export { renderRun, renderMinimize, renderExplain } from './report.js'

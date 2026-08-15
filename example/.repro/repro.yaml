@@ -1,0 +1,96 @@
+# Reproduction spec — edit freely, this file is the source of truth.
+# Bug report:
+#   Checkout returns 500 after changing the shipping address twice and applying SAVE20
+name: checkout-address-coupon
+description: Checkout returns 500 after changing the shipping address twice and applying SAVE20
+base_url: http://localhost:3100
+
+setup:
+  - shell: npm run db:reset
+    expect: { exit_code: 0 }
+  - shell: npm run seed
+    expect: { exit_code: 0 }
+
+services:
+  - name: app
+    command: npm run dev
+    wait_for:
+      http: http://localhost:3100/health
+      timeout_ms: 30000
+
+scenario:
+  - name: health check
+    http: { method: GET, url: /health }
+    expect: { status: 200 }
+
+  - name: create session
+    http: { method: POST, url: /api/session }
+    expect: { status: 201 }
+    save: { sid: $.session }
+
+  - name: browse products
+    http: { method: GET, url: /api/products }
+    expect: { status: 200 }
+
+  - name: add widget to cart
+    http:
+      method: POST
+      url: /api/cart/items
+      headers: { x-session: "${sid}" }
+      json: { product: widget }
+    expect: { status: 200 }
+
+  - name: open cart
+    http: { method: GET, url: /api/cart, headers: { x-session: "${sid}" } }
+    expect: { status: 200 }
+
+  - name: set shipping address to CA
+    http:
+      method: PUT
+      url: /api/shipping-address
+      headers: { x-session: "${sid}" }
+      json: { country: US, state: CA }
+    expect: { status: 200 }
+
+  - name: review cart after address
+    http: { method: GET, url: /api/cart, headers: { x-session: "${sid}" } }
+    expect: { status: 200 }
+
+  - name: add gizmo to cart
+    http:
+      method: POST
+      url: /api/cart/items
+      headers: { x-session: "${sid}" }
+      json: { product: gizmo }
+    expect: { status: 200 }
+
+  - name: change shipping address to WA
+    http:
+      method: PUT
+      url: /api/shipping-address
+      headers: { x-session: "${sid}" }
+      json: { state: WA }
+    expect: { status: 200 }
+
+  - name: review cart after change
+    http: { method: GET, url: /api/cart, headers: { x-session: "${sid}" } }
+    expect: { status: 200 }
+
+  - name: apply coupon SAVE20
+    http:
+      method: POST
+      url: /api/coupon
+      headers: { x-session: "${sid}" }
+      json: { code: SAVE20 }
+    expect: { status: 200 }
+
+  - name: checkout
+    http: { method: POST, url: /api/checkout, headers: { x-session: "${sid}" } }
+
+failure:
+  step: checkout
+  expect:
+    status: 200
+  reproduce:
+    status: 500
+    exception: Cannot read properties of null

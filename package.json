@@ -1,0 +1,54 @@
+{
+  "name": "repro",
+  "version": "0.1.0",
+  "description": "Turn any bug report into a reproduction your coding agent can run.",
+  "type": "module",
+  "bin": {
+    "repro": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "bug",
+    "reproduction",
+    "repro",
+    "debugging",
+    "agent",
+    "ai",
+    "regression",
+    "minimize",
+    "bisect"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "playwright": "^1.62.1",
+    "typescript": "^5.7.2"
+  },
+  "peerDependencies": {
+    "playwright": "*"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Reproduction evidence is per-machine noise; the spec itself is not.
+**/.repro/runs/
+**/.repro/artifacts/
+**/.repro/*.min.yaml
+**/.repro/*.original.yaml

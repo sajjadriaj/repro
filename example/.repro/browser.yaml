@@ -1,0 +1,55 @@
+# Same bug, driven through the UI instead of the API.
+#   repro run --spec .repro/browser.yaml
+# Requires playwright: npm i -D playwright && npx playwright install chromium
+name: checkout-address-coupon-ui
+description: Placing an order fails after changing the shipping state twice and applying SAVE20
+base_url: http://localhost:3100
+
+services:
+  - name: app
+    command: npm run dev
+    wait_for:
+      http: http://localhost:3100/health
+      timeout_ms: 30000
+
+scenario:
+  - name: open checkout
+    keep: true
+    browser:
+      - goto: /
+      - wait_for: "#status"
+      - expect_text: { selector: "#status", value: session ready }
+
+  - name: set shipping state to CA
+    browser:
+      - fill: { selector: "#state", value: CA }
+      - click: "#save-address"
+      - expect_text: { selector: "#status", value: "address saved: CA" }
+
+  - name: change shipping state to WA
+    browser:
+      - fill: { selector: "#state", value: WA }
+      - click: "#save-address"
+      - expect_text: { selector: "#status", value: "address saved: WA" }
+
+  - name: apply coupon SAVE20
+    browser:
+      - fill: { selector: "#coupon", value: SAVE20 }
+      - click: "#apply-coupon"
+      - expect_text: { selector: "#status", value: coupon applied }
+
+  - name: place order
+    browser:
+      - click: "#checkout"
+      # Both outcomes read "<something>: <detail>", so this waits for either
+      # without asserting which one happened — that is `failure`'s job.
+      - wait_for_text: { selector: "#status", value: ": " }
+      - screenshot: checkout-result
+
+failure:
+  step: place order
+  expect:
+    body_contains: order placed
+  reproduce:
+    status: 500
+    body_contains: "Checkout failed: Cannot read properties of null"
