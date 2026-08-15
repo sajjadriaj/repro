@@ -180,7 +180,9 @@ export async function minimize(
           if ((await prober.test(candidate)).reproduced) {
             current = candidate
             progress.push(current.length)
-            opts.onProgress?.(`removed ${block.length} steps → ${current.length}`)
+            opts.onProgress?.(
+              `removed ${block.length} step${block.length === 1 ? '' : 's'} → ${current.length}`,
+            )
             progressed = true
             break
           }

@@ -52,6 +52,9 @@ export async function bisect(loaded: LoadedSpec, opts: BisectOptions): Promise<B
     quote(loaded.root),
     ...(opts.repeat ? ['--repeat', String(opts.repeat)] : []),
     ...(opts.timeoutMs ? ['--timeout', String(opts.timeoutMs)] : []),
+    // git prints whatever the predicate prints, once per commit. Only the
+    // exit code carries meaning here, so drop the rest.
+    '>/dev/null 2>&1',
   ].join(' ')
 
   let output = ''

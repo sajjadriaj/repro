@@ -176,6 +176,8 @@ async function cmdFrom(positionals: string[], flags: Flags): Promise<number> {
 
 async function cmdRun(flags: Flags): Promise<number> {
   const loaded = await load(flags)
+  // --quiet drops the running commentary; the verdict is the point of the
+  // command and survives everything except --json.
   const quiet = flags.quiet === true || flags.json === true
   if (!quiet) process.stdout.write(`${bold('REPRO')} ${loaded.spec.name}\n`)
 
@@ -191,7 +193,7 @@ async function cmdRun(flags: Flags): Promise<number> {
   })
 
   if (flags.json) process.stdout.write(`${JSON.stringify(toJson(result), null, 2)}\n`)
-  else if (!quiet) process.stdout.write(`${renderRun(result)}\n\n`)
+  else process.stdout.write(`${renderRun(result)}\n\n`)
 
   if (flags['exit-code']) {
     // git-bisect contract: 0 = good, 1 = bad, 125 = untestable.
@@ -312,15 +314,28 @@ async function cmdBisect(flags: Flags): Promise<number> {
   const quiet = flags.quiet === true || flags.json === true
   if (!quiet) process.stdout.write(`${bold('BISECT')} ${loaded.spec.name}\n`)
 
+  // git echoes the whole predicate before every probe; the interesting lines
+  // are "Bisecting: N revisions left" and the verdict.
+  let pending = ''
+  const relay = (chunk: string) => {
+    if (quiet) return
+    pending += chunk
+    const lines = pending.split('\n')
+    pending = lines.pop() ?? ''
+    for (const line of lines) {
+      if (line.startsWith('running ')) continue
+      process.stdout.write(`${dim(line)}\n`)
+    }
+  }
+
   const result = await bisect(loaded, {
     good: flags.good,
     bad: flags.bad,
     repeat: num(flags.repeat),
     timeoutMs: num(flags.timeout),
-    onOutput: (chunk) => {
-      if (!quiet) process.stdout.write(dim(chunk))
-    },
+    onOutput: relay,
   })
+  if (pending && !quiet) process.stdout.write(`${dim(pending)}\n`)
 
   if (flags.json) {
     process.stdout.write(
@@ -461,7 +476,7 @@ ${bold('OPTIONS')}
   --spec <file>          Use a specific spec file                 (all)
   --root <dir>           Project root, default the spec's parent  (all)
   --force                Overwrite existing files                 (init, export)
-  --quiet                Suppress progress output                 (all)
+  --quiet                Drop progress output, keep the verdict   (all)
 
 ${bold('EXAMPLES')}
   repro init "checkout returns 500 after changing address and applying SAVE20"
