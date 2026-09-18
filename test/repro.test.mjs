@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 
 import {
@@ -602,6 +602,26 @@ test('an agent bug reproduces on its trace, with the trajectory as evidence', { 
     assert.match(fixed.failure.mismatch.join(' '), /no tool_call "refund_order"/)
   } finally {
     rmSync(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('--root anchors the spec search, so a parent .repro cannot hijack the run', () => {
+  const outer = mkdtempSync(path.join(os.tmpdir(), 'repro-root-'))
+  const inner = path.join(outer, 'inner')
+  const spec = (name) => `name: ${name}\nscenario:\n  - id: s\n    shell: exit 7\nfailure:\n  step: s\n  reproduce:\n    exit_code: 7\n`
+  try {
+    mkdirSync(path.join(outer, '.repro'), { recursive: true })
+    writeFileSync(path.join(outer, '.repro', 'repro.yaml'), spec('outer-decoy'))
+    mkdirSync(path.join(inner, '.repro'), { recursive: true })
+    writeFileSync(path.join(inner, '.repro', 'repro.yaml'), spec('inner-target'))
+
+    const out = execFileSync(process.execPath, [cli, 'run', '--json', '--quiet', '--root', inner], {
+      cwd: outer,
+      encoding: 'utf8',
+    })
+    assert.equal(JSON.parse(out).name, 'inner-target')
+  } finally {
+    rmSync(outer, { recursive: true, force: true })
   }
 })
 

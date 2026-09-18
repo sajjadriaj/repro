@@ -530,7 +530,7 @@ function relativeSpecifier(from: string, to: string): string {
 // ------------------------------------------------------------------ shared
 
 async function load(flags: Flags): Promise<LoadedSpec> {
-  const loaded = await loadSpec(flags.spec)
+  const loaded = await loadSpec(flags.spec, flags.root)
   return flags.root ? { ...loaded, root: path.resolve(flags.root) } : loaded
 }
 

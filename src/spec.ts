@@ -208,7 +208,7 @@ export type LoadedSpec = {
   specPath: string
 }
 
-export async function loadSpec(specPath?: string): Promise<LoadedSpec> {
+export async function loadSpec(specPath?: string, from?: string): Promise<LoadedSpec> {
   let resolved: string
   let reproDir: string
   if (specPath) {
@@ -216,7 +216,7 @@ export async function loadSpec(specPath?: string): Promise<LoadedSpec> {
     if (!existsSync(resolved)) throw new SpecError(`no such spec: ${resolved}`)
     reproDir = path.dirname(resolved)
   } else {
-    const found = findReproDir()
+    const found = findReproDir(from)
     if (!found) {
       throw new SpecError(
         `no .repro/${SPEC_FILE} found in this directory or any parent.\n` +
