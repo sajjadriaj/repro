@@ -32,6 +32,7 @@ whichever one you use.
 - [Quick start](#quick-start)
 - [The spec](#the-spec)
 - [Commands](#commands)
+- [The gate](#repro-hook)
 - [Spec reference](#spec-reference)
 - [LLM agents](#llm-agents)
 - [Agent integration](#agent-integration)
@@ -113,6 +114,14 @@ database, setup scripts — and writes:
 ├── scripts/
 └── runs/          evidence bundles, one per run
 ```
+
+One thing it will not infer for you: a setup script that destroys data.
+`db:reset`, `seed`, `drop` and their relatives are detected and written into
+`repro.yaml` **as comments**, never into `setup:` — which runs before *every*
+iteration, so an unread `db:seed` becomes a hundred reseeds under
+`--repeat 100`, against whatever database is configured. Move them in yourself
+if the reproduction needs a clean slate. A tool whose argument is "do not trust
+the inference" should not quietly infer one of those.
 
 `repro.yaml` arrives complete except for the scenario, because the scenario is
 the one thing that cannot be read off disk. Point your agent at `COMPILE.md`; it
@@ -261,7 +270,17 @@ little, twenty consistent runs say a lot. After a fix, run it a few hundred
 times and see whether the rate actually moved.
 
 Services start once per invocation and setup steps run before each iteration, so
-`--repeat 20` does not mean twenty dev-server boots. Set `restart_services: true`
+`--repeat 20` does not mean twenty dev-server boots. When the application is
+already running — a dev server you are using, a staging deployment, a container
+— `--base-url` reuses it and skips `services:` entirely:
+
+```bash
+repro run --repeat 200 --base-url http://localhost:3000
+```
+
+The spec is not edited, so the seal does not move: where the app runs was never
+part of the bug. An unreachable URL makes the run `invalid`, never a pass —
+nothing was disproven because nothing was reached. Set `restart_services: true`
 when a run must not inherit any process state.
 
 ### Four outcomes, not two
@@ -331,6 +350,28 @@ The seal hashes the bug definition — steps, failure signature, fixtures, scrip
 prose about the bug rather than part of it, so rewording it does not break a
 seal; changing a matcher does.
 
+Three questions, three hashes, because conflating them broke seals for reasons
+that had nothing to do with the bug:
+
+| hash | covers | what a change means |
+| --- | --- | --- |
+| **contract** | `scenario`, `failure`, `setup`, `teardown`, `env`, `vars`, `verify` | the bug or the goalposts moved — `verify` exits `2` |
+| **execution** | the same, minus `verify` | what ran changed, so the baseline no longer measures it — `seal` asks you to re-establish |
+| **environment** | `base_url`, `services` | where it runs changed. Reported as drift; the seal still holds |
+
+`base_url` and `services` are deliberately outside the bug. "The notes route
+accepts a write it should refuse" is the bug; "port 3000 answered 201" is where
+it was observed, and a rate measured on one port is the same rate on another.
+That is a judgement call and it is stated rather than hidden: a `services.env`
+flag *can* be what causes a bug, so an edit there prints on every `verify` and
+`status`, the same bargain repro already makes with the commit hash.
+
+`verify` is in the contract but not in the execution hash for the same kind of
+reason. An elimination policy judges numbers that already exist — declaring one
+does not re-run anything, so it must not invalidate a baseline. Relaxing
+`reproduced: {max: 0}` to `{max: 5}` still breaks the seal, because that is
+exactly the move a seal exists to expose.
+
 Sealing does not lock the file. It makes editing the file impossible to hide:
 
 ```
@@ -375,6 +416,72 @@ With a policy declared, verify reports `PASS` or `FAIL` and exits `0` or `1`.
 Without one it reports the change and stops there. A modified contract exits `2`
 whatever the runs said, because the comparison is no longer between like and
 like.
+
+### repro status
+
+Where the reproduction stands, without running it.
+
+```
+$ repro status
+REPRO checkout-address-coupon
+
+Contract:
+  UNCHANGED
+
+Environment:
+  MODIFIED  base_url, services
+  the seal still holds — base_url and services are not part of the bug
+
+Baseline:
+  23 / 98 valid runs  23.5%  RARE
+  2026-09-18T10:42:06.001Z
+```
+
+`verify` boots the application to answer "did the rate move". That is the right
+cost for that question and the wrong one for "has the contract been edited",
+which a gate asks on every single invocation. `status` is a few file reads.
+
+Exits `2` when the contract or the fixtures moved, `0` otherwise — an edited
+`base_url` is reported, never a failure.
+
+### repro hook
+
+The completion gate, as a Claude Code Stop hook.
+
+```bash
+repro hook --install      # adds it to .claude/settings.json
+repro hook --print        # shows the snippet
+```
+
+A Stop hook runs when the agent believes it is finished, which is the one moment
+worth interrupting. The reproduction runs; the outcome decides; a refusal hands
+the agent the measurement as its next instruction.
+
+**The seal picks the polarity, because repro is used for two opposite jobs.**
+While the reproduction is being compiled the agent is trying to *make* the bug
+happen, so a run that does not reproduce is the unfinished state. After the fix
+it is trying to make it *stop*, so a run that reproduces is. Blocking on the
+wrong one would fight the agent for its whole budget.
+
+`repro establish && repro seal` is by definition performed while the bug still
+reproduces, so the seal already records which job this is:
+
+| state | the gate wants | blocks while |
+| --- | --- | --- |
+| no seal | REPRODUCED | the scenario is still a stub |
+| sealed | NOT REPRODUCED | the bug is back |
+
+Three things never gate. An `invalid` or `error` run is untestable — a
+precondition failed or a service never came up, so the bug was neither
+reproduced nor disproven, and blocking a stop over a dead port spends the budget
+on the environment. An edited contract does not gate either: an agent that
+cannot keep a bug fixed can edit the bug instead, and declining to gate makes
+that visible in the transcript rather than a wall to climb. And after
+`--max-attempts` refusals (default 3) it lets go, leaving `.repro/feedback.md`
+where the next reader will look.
+
+The hook is a no-op in a directory with no `.repro/repro.yaml`, so it is safe to
+leave installed.
 
 ### repro minimize
 
@@ -499,11 +606,11 @@ Bug report -> reproduction -> minimized -> sealed -> agent fix -> verified -> re
 | --- | --- |
 | `name` | identifier for the reproduction (required) |
 | `description` | human summary of the bug |
-| `base_url` | prefix for relative `http.url` and browser `goto` targets |
+| `base_url` | prefix for relative `http.url` and browser `goto` targets. Environment, not bug |
 | `env` | environment variables for services and shell steps |
 | `vars` | initial values for `${interpolation}` |
 | `setup` | steps run before services start, on every iteration |
-| `services` | long-running processes to supervise |
+| `services` | long-running processes to supervise. Environment, not bug |
 | `scenario` | the reproduction steps (required) |
 | `failure` | what counts as reproduced (required) |
 | `teardown` | steps run after the scenario, always |
@@ -727,6 +834,21 @@ goalposts while working:
 repro establish --repeat 20 && repro seal   # before the fix
 repro verify                                # after it
 ```
+
+Better still, stop asking the agent to police itself. `repro hook --install`
+makes the reproduction the loop's terminating condition — the agent stops when
+the bug stops reproducing, not when it feels done, and before the seal exists it
+cannot stop while the reproduction is still a stub.
+
+And when it is fixed, retire the spec into the project's own test suite:
+
+```bash
+repro export --test
+```
+
+That is the end of the arc, not `not_reproduced`. A `.repro/` directory nobody
+runs again is how the thing you built to stop an agent deleting a test becomes a
+test nobody owns.
 
 repro is also importable as a library:
 

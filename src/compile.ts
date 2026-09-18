@@ -22,6 +22,11 @@ export type ProjectFacts = {
   scripts: Record<string, string>
   devCommand?: string
   setupCommands: string[]
+  /**
+   * Scripts that look like they destroy data. Detected, named, and deliberately
+   * NOT written into `setup:` — see the note where they are classified.
+   */
+  destructiveSetupCommands: string[]
   baseUrl?: string
   healthUrl?: string
   database?: string
@@ -30,6 +35,9 @@ export type ProjectFacts = {
   envExample?: string
   notes: string[]
 }
+
+/** Words that mean "this throws data away". Matched against the script NAME. */
+const DESTRUCTIVE_SCRIPT = /(reset|seed|drop|wipe|truncate|flush|purge|clean|nuke)/i
 
 const FRAMEWORKS: [string, string][] = [
   ['next', 'Next.js'],
@@ -62,6 +70,7 @@ export async function detectProject(root: string): Promise<ProjectFacts> {
     language: 'unknown',
     scripts: {},
     setupCommands: [],
+    destructiveSetupCommands: [],
     hasPlaywright: false,
     notes: [],
   }
@@ -95,8 +104,21 @@ export async function detectProject(root: string): Promise<ProjectFacts> {
   const devScript = ['dev', 'start:dev', 'serve', 'start'].find((s) => s in facts.scripts)
   if (devScript) facts.devCommand = run(devScript)
 
+  // `setup:` runs before EVERY iteration, so an inferred `db:seed` that nobody
+  // read becomes a hundred reseeds under `--repeat 100`, against whatever
+  // DATABASE_URL happens to be live. A tool whose whole argument is "do not
+  // trust the inference" must not quietly infer a command that destroys data:
+  // these are detected and named, and the author decides.
   for (const candidate of ['db:reset', 'db:migrate', 'migrate', 'prisma:migrate', 'seed', 'db:seed']) {
-    if (candidate in facts.scripts) facts.setupCommands.push(run(candidate))
+    if (!(candidate in facts.scripts)) continue
+    if (DESTRUCTIVE_SCRIPT.test(candidate)) facts.destructiveSetupCommands.push(run(candidate))
+    else facts.setupCommands.push(run(candidate))
+  }
+  if (facts.destructiveSetupCommands.length) {
+    facts.notes.push(
+      `${facts.destructiveSetupCommands.join(', ')} look like they reset data — left OUT of ` +
+        '`setup:` and listed as comments in the spec. `setup:` runs before every iteration.',
+    )
   }
 
   if (existsSync(path.join(root, 'prisma', 'schema.prisma'))) facts.database = 'Prisma'
@@ -258,6 +280,21 @@ function header(input: DraftInput): string {
       .split('\n')
       .map((l) => `#   ${l}`),
     ...(input.raw ? ['# Full report: .repro/report.md'] : []),
+    // Offered rather than inferred. `setup:` runs before every iteration, so a
+    // reseed nobody read runs once per repetition against the live database.
+    // Uncommenting is a decision; having it appear in the file is not.
+    ...(input.facts.destructiveSetupCommands.length
+      ? [
+          '#',
+          '# These scripts were detected and deliberately NOT added to `setup:` —',
+          '# setup runs before EVERY iteration, so `--repeat 100` would run them a',
+          '# hundred times against whatever database is configured. Move them in',
+          '# yourself if this reproduction needs a clean slate:',
+          '#',
+          '# setup:',
+          ...input.facts.destructiveSetupCommands.map((c) => `#   - shell: ${c}`),
+        ]
+      : []),
     '',
   ].join('\n')
 }
@@ -294,6 +331,7 @@ ${complete ? 'Steps were extracted from the supplied evidence.' : 'The scenario 
 | base url | ${spec.base_url ?? 'unknown'} |
 | database | ${f.database ?? 'none detected'} |
 | setup scripts | ${f.setupCommands.join(', ') || 'none detected'} |
+${f.destructiveSetupCommands.length ? `| destructive scripts | ${f.destructiveSetupCommands.join(', ')} — NOT in setup:, see the comments in repro.yaml |\n` : ''}
 | test runner | ${f.testRunner ?? 'none'} |
 | playwright | ${f.hasPlaywright ? 'installed' : 'not installed'} |
 ${f.envExample ? `| env template | ${f.envExample} |\n` : ''}

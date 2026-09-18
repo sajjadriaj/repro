@@ -1,6 +1,6 @@
 {
   "name": "repro",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn any bug report into a reproduction your coding agent can run.",
   "type": "module",
   "bin": {

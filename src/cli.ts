@@ -10,8 +10,9 @@ import { runReproduction, type RepeatResult } from './run.js'
 import { minimize } from './minimize.js'
 import { explain } from './explain.js'
 import { bisect } from './bisect.js'
-import { establish, seal, SealError, verify } from './seal.js'
+import { establish, seal, SealError, status, verify } from './seal.js'
 import { detectProject, importEvidence, scaffold, type Imported } from './compile.js'
+import { DEFAULT_MAX_ATTEMPTS, HookError, install as installHook, snippet, stopHook } from './hook.js'
 import {
   bold,
   cyan,
@@ -24,11 +25,12 @@ import {
   renderMinimize,
   renderRun,
   renderSeal,
+  renderStatus,
   renderVerify,
   yellow,
 } from './report.js'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 const OPTIONS = {
   json: { type: 'boolean' as const, default: false },
@@ -38,6 +40,10 @@ const OPTIONS = {
   timeout: { type: 'string' as const },
   spec: { type: 'string' as const },
   root: { type: 'string' as const },
+  'base-url': { type: 'string' as const },
+  'max-attempts': { type: 'string' as const },
+  install: { type: 'boolean' as const, default: false },
+  print: { type: 'boolean' as const, default: false },
   out: { type: 'string' as const },
   from: { type: 'string' as const },
   good: { type: 'string' as const },
@@ -90,6 +96,10 @@ async function main(argv: string[]): Promise<number> {
       return cmdSeal(flags)
     case 'verify':
       return cmdVerify(flags)
+    case 'status':
+      return cmdStatus(flags)
+    case 'hook':
+      return cmdHook(flags)
     case 'minimize':
       return cmdMinimize(flags)
     case 'explain':
@@ -204,6 +214,7 @@ async function cmdRun(flags: Flags): Promise<number> {
 
   const result = await runReproduction(loaded, {
     repeat: num(flags.repeat) ?? 1,
+    baseUrl: flags['base-url'],
     trace: flags.trace,
     headed: flags.headed,
     timeoutMs: num(flags.timeout),
@@ -265,6 +276,7 @@ async function cmdEstablish(flags: Flags): Promise<number> {
   const { baseline, path: file } = await establish(loaded, {
     // A single run is a story, not a baseline.
     repeat: num(flags.repeat) ?? 10,
+    baseUrl: flags['base-url'],
     timeoutMs: num(flags.timeout),
     version: VERSION,
     onPhase: (phase, status, detail) => {
@@ -305,6 +317,7 @@ async function cmdVerify(flags: Flags): Promise<number> {
 
   const report = await verify(loaded, {
     repeat: num(flags.repeat),
+    baseUrl: flags['base-url'],
     timeoutMs: num(flags.timeout),
     version: VERSION,
     onPhase: (phase, status, detail) => {
@@ -334,6 +347,7 @@ async function cmdMinimize(flags: Flags): Promise<number> {
   const result = await minimize(loaded, {
     confirm: num(flags.confirm) ?? 1,
     verify: num(flags.verify) ?? 3,
+    baseUrl: flags['base-url'],
     timeoutMs: num(flags.timeout),
     onProgress: (message) => {
       if (!quiet) process.stdout.write(`${dim(`  ${message}`)}\n`)
@@ -386,6 +400,7 @@ async function cmdExplain(flags: Flags): Promise<number> {
 
   const report = await explain(loaded, {
     confirm: num(flags.confirm) ?? 1,
+    baseUrl: flags['base-url'],
     timeoutMs: num(flags.timeout),
     onProgress: (message) => {
       if (!quiet) process.stdout.write(`${dim(`  ${message}`)}\n`)
@@ -529,6 +544,60 @@ function relativeSpecifier(from: string, to: string): string {
 
 // ------------------------------------------------------------------ shared
 
+// ------------------------------------------------------------ status / hook
+
+async function cmdStatus(flags: Flags): Promise<number> {
+  const loaded = await load(flags)
+  const report = await status(loaded, VERSION)
+  if (flags.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
+  else process.stdout.write(`${renderStatus(report)}\n\n`)
+  // Same code `verify` uses for a moved contract, and for the same reason: the
+  // comparison is no longer between like and like. An edited base_url or
+  // service command is not that, and does not reach here.
+  return report.contract === 'MODIFIED' || report.fixtures === 'MODIFIED' ? 2 : 0
+}
+
+async function cmdHook(flags: Flags): Promise<number> {
+  const maxAttempts = num(flags['max-attempts']) ?? DEFAULT_MAX_ATTEMPTS
+  if (flags.print) {
+    process.stdout.write(`${snippet(maxAttempts, flags.spec)}\n`)
+    return 0
+  }
+  if (flags.install) {
+    try {
+      const { path: file, added } = installHook({ maxAttempts, specPath: flags.spec })
+      process.stdout.write(
+        [
+          added ? `wrote ${cyan(file)}` : `${cyan(file)} already runs the gate`,
+          '',
+          'Claude Code now runs the reproduction every time it believes it is finished.',
+          'Before the bug is sealed the gate wants it to REPRODUCE — an agent cannot stop',
+          'while the reproduction is still a stub. Once sealed it wants the opposite, so a',
+          `regression sends the measurement back and keeps it working, up to ${maxAttempts} time(s).`,
+          '',
+          dim('The hook is a no-op in a directory with no .repro/repro.yaml.'),
+          '',
+        ].join('\n'),
+      )
+      return 0
+    } catch (err) {
+      if (err instanceof HookError) {
+        process.stderr.write(`${red('error:')} ${err.message}\n`)
+        return 2
+      }
+      throw err
+    }
+  }
+  return stopHook({
+    maxAttempts,
+    specPath: flags.spec,
+    root: flags.root,
+    baseUrl: flags['base-url'],
+    repeat: num(flags.repeat),
+    timeoutMs: num(flags.timeout),
+  })
+}
+
 async function load(flags: Flags): Promise<LoadedSpec> {
   const loaded = await loadSpec(flags.spec, flags.root)
   return flags.root ? { ...loaded, root: path.resolve(flags.root) } : loaded
@@ -554,6 +623,8 @@ ${bold('COMMANDS')}
   establish              Measure the failure repeatedly and record a baseline
   seal                   Freeze the contract, baseline and environment
   verify                 Re-run the sealed contract and compare
+  status                 What is sealed, and what has moved. Runs nothing
+  hook                   The completion gate; --install wires it into Claude Code
   minimize               Cut the scenario to the steps that actually matter
   explain                Locate the failure boundary and collect evidence
   bisect                 Find the commit that introduced the failure
@@ -561,6 +632,7 @@ ${bold('COMMANDS')}
 
 ${bold('OPTIONS')}
   --repeat <n>           Run n times; measures flakiness  (run, establish, verify, bisect)
+  --base-url <url>       The app is already running there; skip services:
   --json                 Machine-readable output                  (all)
   --exit-code            Exit 1 when reproduced, 125 on error     (run)
   --confirm <n>          Runs required per probe                  (minimize, explain)
@@ -574,6 +646,8 @@ ${bold('OPTIONS')}
   --root <dir>           Project root, default the spec's parent  (all)
   --force                Overwrite existing files                 (init, export)
   --quiet                Drop progress output, keep the verdict   (all)
+  --install / --print    Write the Stop hook, or show it          (hook)
+  --max-attempts <n>     Refusals before the gate lets go, default 3  (hook)
 
 ${bold('EXAMPLES')}
   repro init "checkout returns 500 after changing address and applying SAVE20"
@@ -584,6 +658,10 @@ ${bold('EXAMPLES')}
   repro minimize --write
   repro explain
   repro bisect --good v2.4.1 --bad HEAD
+  repro status              ${dim('# has the contract moved? no application boot')}
+  repro hook --install      ${dim('# gate every stop on the reproduction')}
+  repro run --base-url http://localhost:3000   ${dim('# reuse the app already running')}
+  repro export --test       ${dim('# retire the spec into a real regression test')}
   repro run --json          ${dim('# what your coding agent should loop on')}
 `
 }

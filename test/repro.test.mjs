@@ -10,14 +10,21 @@ import {
   aggregate,
   classify,
   contractHash,
+  executionHash,
+  legacyContractHash,
+  comparableContractHash,
+  specEnvironment,
+  specEnvironmentDrift,
   evaluatePolicy,
   confidenceOf,
   detectProject,
+  draftSpec,
   diffNetworks,
   extractErrorMessage,
   failureStepIndex,
   fromHar,
   fromText,
+  install,
   interpolate,
   jsonPath,
   matchOutcome,
@@ -257,7 +264,24 @@ test('detectProject reads the example app', async () => {
   assert.equal(facts.packageManager, 'npm')
   assert.equal(facts.devCommand, 'npm run dev')
   assert.equal(facts.baseUrl, 'http://localhost:3100')
-  assert.deepEqual(facts.setupCommands, ['npm run db:reset', 'npm run seed'])
+  // Both of the example app's setup scripts destroy data, so neither is
+  // inferred into `setup:` — which runs before every iteration.
+  assert.deepEqual(facts.setupCommands, [])
+  assert.deepEqual(facts.destructiveSetupCommands, ['npm run db:reset', 'npm run seed'])
+})
+
+test('a destructive setup script is offered as a comment, never inferred', () => {
+  const facts = {
+    packageManager: 'npm',
+    scripts: {},
+    setupCommands: ['npm run build'],
+    destructiveSetupCommands: ['npm run db:reset'],
+    notes: [],
+  }
+  const spec = draftSpec({ description: 'checkout explodes', facts })
+  // In the spec: the safe one only.
+  assert.deepEqual(spec.setup, [{ shell: 'npm run build' }])
+  assert.equal(JSON.stringify(spec).includes('db:reset'), false)
 })
 
 // -------------------------------------------------------------------- explain
@@ -442,6 +466,71 @@ test('the contract hash ignores prose and key order, not the bug definition', ()
   assert.equal(contractHash(spec), contractHash(reordered))
   assert.equal(contractHash(spec), contractHash({ ...spec, description: 'reworded' }))
   assert.notEqual(contractHash(spec), contractHash({ ...spec, failure: { reproduce: { status: 502 } } }))
+})
+
+test('where the app runs is not part of the bug', () => {
+  const spec = {
+    name: 'x',
+    base_url: 'http://localhost:3000',
+    services: [{ command: 'npm run dev -- --port 3000' }],
+    scenario: [{ http: { url: '/a' } }],
+    failure: { reproduce: { status: 500 } },
+  }
+  const moved = {
+    ...spec,
+    base_url: 'http://localhost:3010',
+    services: [{ command: 'npm run dev -- --port 3010' }],
+  }
+  // Moving the application changes neither what the bug is nor what was
+  // measured — a rate observed on 3000 is the same rate on 3010.
+  assert.equal(contractHash(spec), contractHash(moved))
+  assert.equal(executionHash(spec), executionHash(moved))
+  // It is still visible: the seal records a hash per environment key.
+  assert.deepEqual(specEnvironmentDrift(specEnvironment(spec), specEnvironment(moved)), [
+    'base_url',
+    'services',
+  ])
+})
+
+test('an elimination policy moves the goalposts but not the measurement', () => {
+  const spec = {
+    name: 'x',
+    scenario: [{ http: { url: '/a' } }],
+    failure: { reproduce: { status: 500 } },
+  }
+  const policed = { ...spec, verify: { trials: 3, reproduced: { max: 0 } } }
+  // Declaring a policy judges the numbers a baseline already recorded; it does
+  // not change what runs, so `seal` must not demand a re-measurement for it.
+  assert.equal(executionHash(spec), executionHash(policed))
+  // It is still sealed, because relaxing it later is exactly the move a seal exists to expose.
+  assert.notEqual(contractHash(spec), contractHash(policed))
+  const relaxed = { ...policed, verify: { trials: 3, reproduced: { max: 5 } } }
+  assert.notEqual(contractHash(policed), contractHash(relaxed))
+})
+
+test('editing the scenario invalidates the measurement as well as the contract', () => {
+  const spec = { name: 'x', scenario: [{ http: { url: '/a' } }], failure: { reproduce: { status: 500 } } }
+  const edited = { ...spec, scenario: [{ http: { url: '/b' } }] }
+  assert.notEqual(contractHash(spec), contractHash(edited))
+  assert.notEqual(executionHash(spec), executionHash(edited))
+})
+
+test('a seal written before the hash split still verifies', () => {
+  const spec = {
+    name: 'x',
+    base_url: 'http://localhost:3000',
+    scenario: [{ http: { url: '/a' } }],
+    failure: { reproduce: { status: 500 } },
+  }
+  // Pre-split seals recorded base_url inside the contract and have no
+  // `execution` field. Invalidating every seal ever written in order to ship a
+  // better definition would be the tool performing the move seals exist to stop.
+  const old = { contract: legacyContractHash(spec) }
+  assert.equal(comparableContractHash(spec, old), old.contract)
+  // A seal written after the split is compared the new way.
+  const fresh = { contract: contractHash(spec), execution: executionHash(spec) }
+  assert.equal(comparableContractHash(spec, fresh), fresh.contract)
+  assert.notEqual(legacyContractHash(spec), contractHash(spec))
 })
 
 test('an elimination policy is only checked when it is declared', () => {
@@ -649,6 +738,82 @@ test('the CLI runs when it is invoked through a symlink', () => {
     const out = execFileSync(process.execPath, [link, '--help'], { encoding: 'utf8' })
     assert.match(out, /USAGE/, 'a symlinked CLI must still run')
   } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('--base-url against nothing is untestable, not a pass', () => {
+  // The dangerous reading of an unreachable app is "the bug stopped happening".
+  // It has to be INVALID: nothing was disproven because nothing was reached.
+  let code = 0
+  try {
+    execFileSync(
+      process.execPath,
+      [cli, 'run', '--exit-code', '--quiet', '--base-url', 'http://127.0.0.1:1'],
+      { cwd: exampleRoot, stdio: 'pipe' },
+    )
+  } catch (err) {
+    code = err.status
+  }
+  assert.equal(code, 125, 'an unreachable --base-url must be untestable, never good')
+})
+
+test('status reports without running anything', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-status-'))
+  try {
+    mkdirSync(path.join(dir, '.repro'), { recursive: true })
+    writeFileSync(
+      path.join(dir, '.repro', 'repro.yaml'),
+      [
+        'name: unsealed',
+        'scenario:',
+        '  - http: { url: /a }',
+        'failure:',
+        '  reproduce: { status: 500 }',
+        '',
+      ].join('\n'),
+    )
+    // No services are declared and none are started: the whole point is that
+    // "has the contract moved" costs a few file reads, not an app boot.
+    const out = execFileSync(process.execPath, [cli, 'status', '--json'], {
+      cwd: dir,
+      encoding: 'utf8',
+    })
+    const report = JSON.parse(out)
+    assert.equal(report.sealed, false)
+    assert.equal(report.contract, 'UNSEALED')
+    assert.match(report.current_contract, /^[0-9a-f]{64}$/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('hook --install merges into settings rather than replacing them', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-hook-'))
+  const cwd = process.cwd()
+  try {
+    mkdirSync(path.join(dir, '.claude'), { recursive: true })
+    const settings = path.join(dir, '.claude', 'settings.json')
+    writeFileSync(
+      settings,
+      JSON.stringify({
+        permissions: { allow: ['Bash(ls)'] },
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'something-else' }] }] },
+      }),
+    )
+    process.chdir(dir)
+    const first = install({ maxAttempts: 2 })
+    assert.equal(first.added, true)
+    const after = JSON.parse(readFileSync(settings, 'utf8'))
+    // Everything the user configured survives; ours is appended.
+    assert.deepEqual(after.permissions.allow, ['Bash(ls)'])
+    assert.equal(after.hooks.Stop.length, 2)
+    assert.match(after.hooks.Stop[1].hooks[0].command, /^repro hook --max-attempts 2$/)
+    // Installing twice must not stack duplicate gates.
+    assert.equal(install({ maxAttempts: 2 }).added, false)
+    assert.equal(JSON.parse(readFileSync(settings, 'utf8')).hooks.Stop.length, 2)
+  } finally {
+    process.chdir(cwd)
     rmSync(dir, { recursive: true, force: true })
   }
 })

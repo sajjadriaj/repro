@@ -162,23 +162,60 @@ export type Spec = {
 }
 
 /**
- * The parts of the spec that define the bug. `description` is prose about the
- * bug, not part of it, so editing it does not break a seal.
+ * Three questions, three key sets, because conflating them made a seal break
+ * for reasons that had nothing to do with the bug.
+ *
+ * `description` is in none of them: it is prose about the bug rather than part
+ * of it, so rewording it has never broken a seal.
  */
-export const CONTRACT_KEYS = [
+
+/**
+ * Where the application lives and how it is started.
+ *
+ * NOT part of the bug. "The notes route accepts a write it should refuse" is
+ * the bug; "port 3000 answered 201" is where it was observed. Moving the app
+ * to another port, renaming the service, or pointing `base_url` at a container
+ * changes none of the predicate — and a fingerprint that said otherwise forced
+ * a re-measurement to record the same number again.
+ *
+ * Changes here are reported as drift, in the same breath as a changed git
+ * commit, and for the same reason: worth seeing, not worth refusing. That is
+ * deliberately a judgement call. A `services.env` flag CAN be what causes the
+ * bug, and an agent could switch one off and call it fixed — so the drift is
+ * printed on every verify rather than buried, which is the same bargain repro
+ * already makes with the commit hash.
+ */
+export const ENVIRONMENT_KEYS = ['base_url', 'services'] as const
+
+/**
+ * What actually executes: the bug, minus the goalposts.
+ *
+ * This is what a baseline measures, so this — and only this — invalidates one.
+ * `verify` is excluded because an elimination policy is applied to the numbers
+ * after the runs finish; declaring one does not change what ran, and being
+ * unable to add a policy after `establish` left no way forward that did not
+ * destroy the record that the bug was ever real.
+ */
+export const EXECUTION_KEYS = [
   'name',
-  'base_url',
   'env',
   'vars',
   'setup',
-  'services',
   'scenario',
   'failure',
   'teardown',
   'restart_services',
   'stop_on_expect_fail',
-  'verify',
 ] as const
+
+/**
+ * What the bug is, plus what counts as fixing it.
+ *
+ * `verify` belongs here and not in EXECUTION_KEYS: an agent that cannot reach
+ * `reproduced: {max: 0}` can relax it to `{max: 5}`, which is exactly the
+ * goalpost-moving a seal exists to expose.
+ */
+export const CONTRACT_KEYS = [...EXECUTION_KEYS, 'verify'] as const
 
 export class SpecError extends Error {}
 

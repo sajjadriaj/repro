@@ -1,7 +1,7 @@
 /** Human-readable rendering. Agent-readable output goes through --json. */
 import path from 'node:path'
 import type { RepeatResult } from './run.js'
-import type { Baseline, Seal, VerifyReport } from './seal.js'
+import type { Baseline, Seal, StatusReport, VerifyReport } from './seal.js'
 import type { MinimizeResult } from './minimize.js'
 import type { ExplainReport } from './explain.js'
 
@@ -312,4 +312,59 @@ export function renderVerify(report: VerifyReport): string {
     )
   }
   return lines.join('\n')
+}
+
+export function renderStatus(report: StatusReport): string {
+  const lines = ['', `${bold('REPRO')} ${report.name}`]
+  const mark = (v: StatusReport['contract']) =>
+    v === 'UNCHANGED' ? green('UNCHANGED') : v === 'MODIFIED' ? red('MODIFIED') : dim('not sealed')
+
+  if (!report.sealed) {
+    lines.push(
+      field(
+        'Seal:',
+        dim(
+          report.established
+            ? 'a baseline exists but nothing is sealed — `repro seal`'
+            : 'not established — `repro establish` while the bug still reproduces',
+        ),
+      ),
+    )
+  }
+  lines.push(
+    field(
+      'Contract:',
+      report.contract === 'MODIFIED'
+        ? `${red('MODIFIED')}\nsealed:  ${report.sealed_contract?.slice(0, 12)}\ncurrent: ${report.current_contract.slice(0, 12)}`
+        : mark(report.contract),
+    ),
+  )
+  if (report.fixtures !== 'UNCHANGED') lines.push(field('Fixtures:', mark(report.fixtures)))
+  if (report.spec_environment === 'MODIFIED') {
+    lines.push(
+      field(
+        'Environment:',
+        // Not red. Where the app runs was never part of the bug; this is the
+        // same category as a changed commit, printed so it cannot be silent.
+        `${yellow('MODIFIED')}  ${dim(report.spec_environment_changed.join(', '))}\n${dim(
+          'the seal still holds — base_url and services are not part of the bug',
+        )}`,
+      ),
+    )
+  }
+  if (report.baseline) {
+    const b = report.baseline
+    lines.push(
+      field(
+        'Baseline:',
+        `${b.reproduced} / ${b.valid} valid runs  ${dim(pct(b.reproduction_rate))}  ${b.classification}\n${dim(
+          b.established_at,
+        )}`,
+      ),
+    )
+  }
+  if (report.environment_drift.length) {
+    lines.push(field('Environment drift:', dim(report.environment_drift.join('\n'))))
+  }
+  return lines.join('\n\n')
 }

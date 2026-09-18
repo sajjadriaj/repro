@@ -52,6 +52,8 @@ export type ExplainReport = {
 export type ExplainOptions = {
   timeoutMs?: number
   confirm?: number
+  /** The application is already running here; do not start `services:`. */
+  baseUrl?: string
   onProgress?: (message: string) => void
 }
 
@@ -61,7 +63,11 @@ export async function explain(
 ): Promise<ExplainReport> {
   const { spec } = loaded
   opts.onProgress?.('running the reproduction')
-  const prober = await makeProber(loaded, { confirm: opts.confirm ?? 1, timeoutMs: opts.timeoutMs })
+  const prober = await makeProber(loaded, {
+    confirm: opts.confirm ?? 1,
+    timeoutMs: opts.timeoutMs,
+    baseUrl: opts.baseUrl,
+  })
 
   try {
     // Share the prober's application instance; a second copy would fight it

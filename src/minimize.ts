@@ -42,6 +42,8 @@ export type ProberOptions = {
   /** Runs per probe; every run must reproduce for the removal to be accepted. */
   confirm?: number
   timeoutMs?: number
+  /** The application is already running here; do not start `services:`. */
+  baseUrl?: string
   onProbe?: (indices: number[], outcome: ProbeOutcome) => void
 }
 
@@ -56,12 +58,12 @@ export async function makeProber(loaded: LoadedSpec, opts: ProberOptions = {}): 
   // Probes share one application instance — booting a dev server per probe
   // would make minimization take longer than reading the code.
   const holder: ServiceHolder | undefined =
-    spec.services?.length && spec.restart_services !== true ? {} : undefined
+    spec.services?.length && spec.restart_services !== true && !opts.baseUrl ? {} : undefined
 
   const once = (indices: number[], runOpts: { evidence?: boolean } = {}): Promise<RunResult> =>
     executeOnce(
       { ...loaded, spec: sliceSpec(spec, indices, failureIndex) },
-      { evidence: runOpts.evidence ?? false, timeoutMs: opts.timeoutMs },
+      { evidence: runOpts.evidence ?? false, timeoutMs: opts.timeoutMs, baseUrl: opts.baseUrl },
       holder,
     )
 
@@ -73,7 +75,7 @@ export async function makeProber(loaded: LoadedSpec, opts: ProberOptions = {}): 
     runOrdered: (indices) =>
       executeOnce(
         { ...loaded, spec: orderedSpec(spec, indices) },
-        { evidence: false, timeoutMs: opts.timeoutMs },
+        { evidence: false, timeoutMs: opts.timeoutMs, baseUrl: opts.baseUrl },
         holder,
       ),
     async test(indices) {

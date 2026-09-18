@@ -659,6 +659,37 @@ function describeWait(wait: WaitForish): string {
   return 'no readiness check'
 }
 
+/**
+ * Confirm an application repro did not start is actually answering.
+ *
+ * Used for `--base-url`, where the caller says the app is already up. Without
+ * this every step fails with its own connection error and the run reads as a
+ * scenario problem; with it the run is INVALID, which is what "I could not get
+ * to the point where the bug is observable" has always meant here.
+ *
+ * Any HTTP answer counts, 404 and 500 included: something is listening and
+ * speaking HTTP, which is all this can honestly claim.
+ */
+export async function assertReachable(baseUrl: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let last = ''
+  for (;;) {
+    try {
+      await fetch(baseUrl, { signal: AbortSignal.timeout(2000) })
+      return
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err)
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `nothing is answering at ${baseUrl} after ${timeoutMs}ms (${last}).\n` +
+          'start the application, or drop --base-url and let the spec\'s `services:` start it.',
+      )
+    }
+    await delay(250)
+  }
+}
+
 export function portOpen(port: number, host = '127.0.0.1'): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = net.connect({ port, host })

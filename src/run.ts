@@ -19,7 +19,14 @@ import {
   type Spec,
 } from './spec.js'
 import { newRunDir, type NetworkEntry, type RunDir } from './evidence.js'
-import { closeBrowser, runStep, startServices, type ExecContext, type ServiceHandle } from './exec.js'
+import {
+  assertReachable,
+  closeBrowser,
+  runStep,
+  startServices,
+  type ExecContext,
+  type ServiceHandle,
+} from './exec.js'
 
 /**
  * Four outcomes, never three. INVALID (a precondition never held, so the
@@ -71,6 +78,16 @@ export type RunResult = {
 
 export type RunOptions = {
   repeat?: number
+  /**
+   * The application is already running here; do not start `services:`.
+   *
+   * Two things it buys. A reproduction stops fighting whatever else holds the
+   * port — a second gate, a dev server the developer is already using — and
+   * `--repeat 100` stops being dominated by application startup, which for a
+   * rate measurement is the whole cost. The spec is not edited, so the seal
+   * does not move: where the app runs was never part of the bug.
+   */
+  baseUrl?: string
   trace?: boolean
   headed?: boolean
   timeoutMs?: number
@@ -116,7 +133,7 @@ export async function runReproduction(
   // holder is filled in by the first run, after its setup steps — starting the
   // app before `db:reset` has run is a different experiment.
   const holder: ServiceHolder | undefined =
-    spec.services?.length && spec.restart_services !== true ? {} : undefined
+    spec.services?.length && spec.restart_services !== true && !opts.baseUrl ? {} : undefined
   try {
     for (let i = 0; i < repeat; i++) {
       results.push(await executeOnce(loaded, opts, holder))
@@ -150,7 +167,7 @@ export async function executeOnce(
 
   const ctx: ExecContext = {
     root,
-    baseUrl: spec.base_url,
+    baseUrl: opts.baseUrl ?? spec.base_url,
     env: spec.env ?? {},
     vars: { ...spec.vars },
     run,
@@ -187,7 +204,19 @@ export async function executeOnce(
     }
 
     // 2. Services
-    if (spec.services?.length) {
+    if (opts.baseUrl) {
+      // Told the app is already up. Confirm that before running a scenario
+      // against nothing: a connection refused on every step is a precondition
+      // failure, not a bug that stopped reproducing.
+      opts.onPhase?.('Services', 'start')
+      try {
+        await assertReachable(opts.baseUrl)
+      } catch (err) {
+        opts.onPhase?.('Services', 'fail', message(err))
+        throw new PreconditionError(message(err))
+      }
+      opts.onPhase?.('Services', 'pass')
+    } else if (spec.services?.length) {
       if (!holder) {
         opts.onPhase?.('Services', 'start')
         try {
