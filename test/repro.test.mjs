@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 
 import {
@@ -633,6 +633,24 @@ test('--exit-code follows the git bisect contract', () => {
     code = err.status
   }
   assert.equal(code, 1, 'a reproducing bug must exit 1 so git bisect calls the commit bad')
+})
+
+test('the CLI runs when it is invoked through a symlink', () => {
+  // How every install puts it on PATH: `npm link`, `npm i -g` from a directory,
+  // pnpm's store, a Homebrew shim. The entry guard compared argv[1] to
+  // import.meta.url with path.resolve, which normalises but does not follow a
+  // link, so the two never matched and the CLI ran nothing, printed nothing and
+  // exited 0 — the shape of failure this tool exists to catch, shipped in the
+  // tool. Output, not exit code, is the discriminator: --help exits 0 either way.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-symlink-'))
+  try {
+    const link = path.join(dir, 'repro')
+    symlinkSync(cli, link)
+    const out = execFileSync(process.execPath, [link, '--help'], { encoding: 'utf8' })
+    assert.match(out, /USAGE/, 'a symlinked CLI must still run')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 function cliOutput(args) {

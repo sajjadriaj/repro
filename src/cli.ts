@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** repro — turn any bug report into a reproduction your coding agent can run. */
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { parseArgs } from 'node:util'
@@ -590,9 +590,30 @@ ${bold('EXAMPLES')}
 
 // ------------------------------------------------------------------- entry
 
+/**
+ * Both sides through realpath, because one of them is usually a symlink.
+ *
+ * `npm link`, `npm i -g` from a directory, pnpm's store and a Homebrew shim all
+ * put a symlink on PATH pointing at the real file, so `process.argv[1]` is the
+ * link and `import.meta.url` is its target. `path.resolve` normalises a path
+ * but does not follow links, so the two never matched and the CLI ran nothing,
+ * printed nothing and exited 0 — a success verdict from a command that never
+ * executed, which is the exact failure this tool exists to catch.
+ *
+ * realpathSync throws on a path that does not exist, and argv[1] can legitimately
+ * be something odd, so each side falls back to the resolved path it had before.
+ */
+const realOrResolved = (p: string): string => {
+  try {
+    return realpathSync(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
+
 const invokedDirectly =
   process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  realOrResolved(process.argv[1]) === realOrResolved(fileURLToPath(import.meta.url))
 
 if (invokedDirectly) {
   main(process.argv.slice(2))
