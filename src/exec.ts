@@ -3,6 +3,7 @@
  * service supervisor that brings the application under test up and down.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import net from 'node:net'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -17,6 +18,8 @@ import {
   type Service,
   type Step,
 } from './spec.js'
+import YAML from 'yaml'
+import { parseTrace, validateJsonSchema, type AgentTrace } from './agent.js'
 import { clip, type NetworkEntry, type RunDir } from './evidence.js'
 
 export type ExecContext = {
@@ -55,6 +58,9 @@ export async function runStep(rawStep: Step, index: number, ctx: ExecContext): P
       case 'browser':
         observed = await execBrowser(step, index, ctx)
         break
+      case 'agent':
+        observed = await execAgent(step, index, ctx)
+        break
       case 'sleep':
         await delay(step.sleep ?? 0)
         observed = { kind: 'sleep', label, duration_ms: 0 }
@@ -63,7 +69,7 @@ export async function runStep(rawStep: Step, index: number, ctx: ExecContext): P
         observed = {
           kind: 'shell',
           label,
-          error: `step ${index + 1} has no executable key (shell/http/browser/sleep)`,
+          error: `step ${index + 1} has no executable key (shell/http/browser/sleep/agent)`,
           duration_ms: 0,
         }
     }
@@ -119,15 +125,16 @@ async function execShell(step: Step, ctx: ExecContext): Promise<Observed> {
 
 export function spawnCapture(
   command: string,
-  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; input?: string },
 ): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     const child = spawn(command, {
       cwd: opts.cwd,
       env: opts.env,
       shell: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })
+    if (opts.input !== undefined) child.stdin?.end(opts.input)
     let stdout = ''
     let stderr = ''
     let timedOut = false
@@ -146,6 +153,98 @@ export function spawnCapture(
       resolve({ code, stdout, stderr, timedOut })
     })
   })
+}
+
+// ------------------------------------------------------------------- agent
+
+/**
+ * Run an agent and normalize whatever it emitted into a trace.
+ *
+ * repro stays out of the agent's business: it hands the input in on stdin and
+ * reads a trace back, as one JSON object or as JSONL, from stdout or from a
+ * file. Anything that can print JSON can be reproduced, with no SDK, no
+ * framework integration and no model inside repro.
+ */
+async function execAgent(step: Step, index: number, ctx: ExecContext): Promise<Observed> {
+  const spec = step.agent!
+  const cwd = spec.cwd ? path.resolve(ctx.root, spec.cwd) : ctx.root
+  const started = Date.now()
+
+  let stdout = ''
+  let stderr = ''
+  let exitCode: number | undefined
+  let error: string | undefined
+
+  if (spec.run) {
+    const result = await spawnCapture(spec.run, {
+      cwd,
+      env: { ...process.env, ...ctx.env, ...spec.env } as NodeJS.ProcessEnv,
+      timeoutMs: spec.timeout_ms ?? ctx.stepTimeoutMs,
+      input: spec.input === undefined ? undefined : `${JSON.stringify(spec.input)}\n`,
+    })
+    stdout = result.stdout
+    stderr = result.stderr
+    exitCode = result.code ?? undefined
+    if (result.timedOut) error = `agent timed out after ${spec.timeout_ms ?? ctx.stepTimeoutMs}ms`
+  } else if (!spec.trace_file) {
+    return {
+      kind: 'agent',
+      label: '',
+      error: 'agent step needs `run`, `trace_file`, or both',
+      duration_ms: 0,
+    }
+  }
+
+  let raw = stdout
+  if (spec.trace_file) {
+    const file = path.resolve(ctx.root, spec.trace_file)
+    raw = await readFile(file, 'utf8').catch((err: Error) => {
+      error ??= `could not read trace_file: ${err.message}`
+      return ''
+    })
+  }
+
+  const trace: AgentTrace = parseTrace(raw)
+  trace.input ??= spec.input
+  trace.duration_ms ??= Date.now() - started
+  if (spec.output_schema !== undefined) {
+    const schema = await loadSchema(spec.output_schema, ctx.root)
+    const errors = validateJsonSchema(schema, trace.output)
+    trace.schema_valid = errors.length === 0
+    trace.schema_errors = errors
+  }
+  if (!trace.events.length && trace.output === undefined && !error) {
+    error = 'the agent produced no trace — expected JSON or JSONL on stdout'
+  }
+
+  const file = await ctx.run
+    .write(path.join('traces', `${String(index + 1).padStart(2, '0')}.json`), JSON.stringify(trace, null, 2))
+    .catch(() => undefined)
+
+  return {
+    kind: 'agent',
+    label: '',
+    // Exposed as `json` too, so `save:` and `json:` path matchers work on a
+    // trace exactly as they do on an HTTP response body.
+    json: trace,
+    trace,
+    stdout: clip(stdout),
+    stderr: clip(stderr),
+    body: clip(stdout),
+    exit_code: exitCode,
+    error,
+    artifacts: file ? [file] : undefined,
+    duration_ms: 0,
+  }
+}
+
+async function loadSchema(
+  schema: string | Record<string, unknown>,
+  root: string,
+): Promise<unknown> {
+  if (typeof schema !== 'string') return schema
+  const text = await readFile(path.resolve(root, schema), 'utf8')
+  return /\.ya?ml$/i.test(schema) ? YAML.parse(text) : JSON.parse(text)
 }
 
 // -------------------------------------------------------------------- http

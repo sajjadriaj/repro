@@ -3,10 +3,14 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 
 import {
+  aggregate,
   classify,
+  contractHash,
+  evaluatePolicy,
   confidenceOf,
   detectProject,
   diffNetworks,
@@ -17,12 +21,16 @@ import {
   interpolate,
   jsonPath,
   matchOutcome,
+  matchValue,
+  parseTrace,
   noisePaths,
   orderedSpec,
   parseCurl,
   sliceSpec,
   slugify,
+  validateJsonSchema,
   validateSpec,
+  wilson,
 } from '../dist/index.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -282,6 +290,171 @@ function net(method, url, status, body) {
   return { step: 1, label: '', method, url, status, response_body: body, duration_ms: 1 }
 }
 
+// --------------------------------------------------------------------- agent
+
+const TRACE_LINES = [
+  'starting up',                                   // agents log; not JSON, ignored
+  '{"type":"model","name":"planner","input":"refund order 123"}',
+  '{"type":"tool_call","tool":"refund_order","arguments":{"order_id":"123","amount":4200}}',
+  '{"type":"tool_result","name":"refund_order","result":{"ok":true}}',
+  '{"type":"output","output":{"status":"refunded","order_id":123},"usage":{"total_tokens":960}}',
+].join('\n')
+
+test('parseTrace reads JSONL, a whole trace, and framework spellings', () => {
+  const trace = parseTrace(TRACE_LINES)
+  assert.equal(trace.events.length, 3)
+  const call = trace.events[1]
+  assert.equal(call.name, 'refund_order', '`tool` is the same field as `name`')
+  assert.deepEqual(call.input, { order_id: '123', amount: 4200 }, '`arguments` is the same field as `input`')
+  assert.deepEqual(trace.events[2].output, { ok: true }, '`result` is the same field as `output`')
+  assert.deepEqual(trace.output, { status: 'refunded', order_id: 123 })
+  assert.equal(trace.usage.total_tokens, 960)
+
+  const whole = parseTrace(JSON.stringify({ events: [{ type: 'message' }], output: 'hi' }))
+  assert.equal(whole.events.length, 1)
+  assert.equal(whole.output, 'hi')
+  assert.deepEqual(parseTrace('not json at all').events, [])
+})
+
+const agentObserved = (trace, duration_ms = 1200) => ({
+  kind: 'agent',
+  label: 'request',
+  trace,
+  json: trace,
+  duration_ms,
+})
+
+test('a trace matches on the tool called and the arguments it was called with', () => {
+  const o = agentObserved(parseTrace(TRACE_LINES))
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'refund_order' } } }, o).ok, true)
+  assert.equal(
+    matchOutcome({ trace: { tool_call: { name: 'refund_order', arguments: { amount: { greater_than: 100 } } } } }, o).ok,
+    true,
+  )
+  const tooSmall = matchOutcome(
+    { trace: { tool_call: { name: 'refund_order', arguments: { amount: { greater_than: 9000 } } } } },
+    o,
+  )
+  assert.equal(tooSmall.ok, false)
+  assert.match(tooSmall.reasons[0], /amount 4200 is not > 9000/)
+  assert.match(matchOutcome({ trace: { tool_call: { name: 'send_email' } } }, o).reasons[0], /no tool_call "send_email"/)
+})
+
+test('a trace matches on how many times a tool was called', () => {
+  const looping = parseTrace(
+    Array.from({ length: 12 }, () => '{"type":"tool_call","name":"web_search","input":{}}').join('\n'),
+  )
+  const o = agentObserved(looping)
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'web_search', count: { greater_than: 10 } } } }, o).ok, true)
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'web_search', count: 12 } } }, o).ok, true)
+  // Zero matches is a count, not an absence: an explicit count must still hold.
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'nope', count: 0 } } }, o).ok, true)
+})
+
+test('a trace matches on what the agent did NOT do first', () => {
+  const unguarded = { trace: { sequence: { contains: [{ tool: 'refund_order' }], not_preceded_by: { tool: 'get_order' } } } }
+  assert.equal(matchOutcome(unguarded, agentObserved(parseTrace(TRACE_LINES))).ok, true)
+
+  const checked = parseTrace(
+    [
+      '{"type":"tool_call","name":"get_order","input":{"order_id":"123"}}',
+      '{"type":"tool_call","name":"refund_order","input":{"order_id":"123"}}',
+    ].join('\n'),
+  )
+  const guarded = matchOutcome(unguarded, agentObserved(checked))
+  assert.equal(guarded.ok, false)
+  assert.match(guarded.reasons[0], /preceded by get_order/)
+
+  const missing = matchOutcome({ trace: { sequence: { contains: [{ tool: 'transfer_money' }] } } }, agentObserved(checked))
+  assert.match(missing.reasons[0], /does not contain transfer_money/)
+})
+
+test('a trace matches on duration, usage and structured output', () => {
+  const trace = parseTrace(TRACE_LINES)
+  const o = agentObserved(trace, 12_000)
+  assert.equal(matchOutcome({ duration_ms: { greater_than: 10_000 } }, o).ok, true)
+  assert.equal(matchOutcome({ usage: { total_tokens: { greater_than: 50_000 } } }, o).ok, false)
+  // Schema validity is unknown unless the step declared a schema to check.
+  assert.match(matchOutcome({ output: { schema: { valid: false } } }, o).reasons[0], /no `output_schema`/)
+  const validated = agentObserved({ ...trace, schema_valid: false, schema_errors: ['$.order_id is number'] })
+  assert.equal(matchOutcome({ output: { schema: { valid: false } } }, validated).ok, true)
+  assert.equal(matchOutcome({ output: { contains: 'refunded' } }, o).ok, true)
+})
+
+test('an object of comparators is a comparison; any other object is a value', () => {
+  assert.equal(matchValue({ greater_than: 1 }, 2, 'x'), undefined)
+  assert.match(matchValue({ greater_than: 1 }, 'two', 'x'), /is not a number/)
+  // `{ state: 'WA' }` is an expected value, not a comparator soup.
+  assert.equal(matchValue({ state: 'WA' }, { state: 'WA' }, 'x'), undefined)
+  assert.match(matchValue({ state: 'WA' }, { state: 'CA' }, 'x'), /!=/)
+  assert.equal(matchValue('SAVE20', 'SAVE20', 'x'), undefined)
+})
+
+test('validateJsonSchema catches the shapes agents actually get wrong', () => {
+  const schema = {
+    type: 'object',
+    required: ['status', 'order_id'],
+    properties: { status: { type: 'string' }, order_id: { type: 'string' } },
+    additionalProperties: false,
+  }
+  assert.deepEqual(validateJsonSchema(schema, { status: 'ok', order_id: '123' }), [])
+  assert.match(validateJsonSchema(schema, { status: 'ok', order_id: 123 })[0], /order_id is number/)
+  assert.match(validateJsonSchema(schema, { status: 'ok' })[0], /order_id is required/)
+  assert.match(validateJsonSchema(schema, { status: 'ok', order_id: '1', extra: 1 })[0], /not allowed/)
+  assert.match(validateJsonSchema({ type: 'object' }, 'a string')[0], /expected object/)
+})
+
+// ------------------------------------------------------- outcomes / baseline
+
+test('an unreached target is INVALID, never a passing run', () => {
+  const spec = { name: 'x', scenario: [], failure: { reproduce: { status: 500 } } }
+  const run = (status) => ({ status, run_id: '1', run_dir: '', duration_ms: 1, steps: [], artifacts: [], network: [], log_excerpt: '' })
+
+  const noneValid = aggregate(spec, [run('invalid'), run('invalid')])
+  assert.equal(noneValid.status, 'invalid', 'a precondition failure is not "not reproduced"')
+  assert.equal(noneValid.reproduction_rate, 0)
+  assert.equal(noneValid.invalid, 2)
+
+  // INVALID runs are excluded from the denominator, not counted as passes.
+  const mixed = aggregate(spec, [run('reproduced'), run('not_reproduced'), run('invalid'), run('error')])
+  assert.equal(mixed.reproduction_rate, 0.5)
+  assert.equal(mixed.invalid, 1)
+  assert.equal(mixed.errors, 1)
+  assert.equal(aggregate(spec, [run('error')]).status, 'error')
+})
+
+test('wilson widens the interval when the sample is small', () => {
+  const [lo10, hi10] = wilson(1, 10)
+  const [lo1000, hi1000] = wilson(100, 1000)
+  assert.ok(hi10 - lo10 > hi1000 - lo1000, 'ten runs must be less certain than a thousand')
+  assert.deepEqual(wilson(0, 0), [0, 0])
+  assert.ok(wilson(0, 100)[1] < 0.05)
+})
+
+test('the contract hash ignores prose and key order, not the bug definition', () => {
+  const spec = {
+    name: 'x',
+    description: 'checkout explodes',
+    scenario: [{ http: { url: '/a' } }],
+    failure: { reproduce: { status: 500 } },
+  }
+  const reordered = { failure: spec.failure, scenario: spec.scenario, name: spec.name }
+  assert.equal(contractHash(spec), contractHash(reordered))
+  assert.equal(contractHash(spec), contractHash({ ...spec, description: 'reworded' }))
+  assert.notEqual(contractHash(spec), contractHash({ ...spec, failure: { reproduce: { status: 502 } } }))
+})
+
+test('an elimination policy is only checked when it is declared', () => {
+  const result = { failures: 0, successes: 500, reproduction_rate: 0 }
+  assert.equal(evaluatePolicy(undefined, result), undefined)
+  assert.equal(evaluatePolicy({ trials: 500 }, result), undefined, 'trials alone declares no threshold')
+  assert.equal(evaluatePolicy({ reproduced: { max: 0 } }, result).result, 'PASS')
+  assert.equal(evaluatePolicy({ reproduced: { max: 0 } }, { ...result, failures: 1 }).result, 'FAIL')
+  assert.equal(evaluatePolicy({ reproduction_rate: { less_than: 0.01 } }, { ...result, reproduction_rate: 0.02 }).result, 'FAIL')
+  // No valid run means no measurement, so no policy can pass on it.
+  assert.equal(evaluatePolicy({ reproduced: { max: 0 } }, { failures: 0, successes: 0, reproduction_rate: 0 }).result, 'FAIL')
+})
+
 // ------------------------------------------------------------------------ e2e
 
 test('the example bug reproduces, minimizes to 5 steps, and reports a boundary', { timeout: 180_000 }, () => {
@@ -320,6 +493,115 @@ test('the same bug reproduces through the browser, with a trace and screenshot',
   const dir = path.dirname(run.artifacts[0])
   for (const artifact of ['trace.zip', 'browser.log', 'network.json', 'screenshots/checkout-result.png']) {
     assert.ok(existsSync(path.join(dir, artifact)), `expected evidence: ${artifact}`)
+  }
+})
+
+test('establish, seal and verify hold the contract still', { timeout: 300_000 }, () => {
+  // Isolated .repro so the baseline and seal do not land in the example.
+  const dir = path.join(os.tmpdir(), `repro-seal-${process.pid}`, '.repro')
+  mkdirSync(dir, { recursive: true })
+  const spec = path.join(dir, 'repro.yaml')
+  writeFileSync(spec, readFileSync(path.join(exampleRoot, '.repro', 'repro.yaml')))
+  // verify exits non-zero while the bug still reproduces; that is the point.
+  const at = (...args) => {
+    try {
+      return cliOutput([...args, '--spec', spec, '--root', exampleRoot, '--quiet'])
+    } catch (err) {
+      if (err.stdout) return err.stdout
+      throw err
+    }
+  }
+
+  try {
+    const baseline = JSON.parse(at('establish', '--repeat', '2', '--json'))
+    assert.equal(baseline.reproduced, 2)
+    assert.equal(baseline.reproduction_rate, 1)
+
+    const sealed = JSON.parse(at('seal', '--json'))
+    assert.equal(sealed.contract, baseline.contract)
+
+    const verified = JSON.parse(at('verify', '--repeat', '1', '--json'))
+    assert.equal(verified.contract, 'UNCHANGED')
+    assert.equal(verified.current.reproduced, 1)
+    assert.equal(verified.policy.result, 'FAIL', 'the bug still reproduces, so the policy must fail')
+
+    // Editing the definition of the bug cannot be hidden from a later verify.
+    writeFileSync(spec, readFileSync(spec, 'utf8').replace('status: 500', 'status: 502'))
+    const drifted = JSON.parse(at('verify', '--repeat', '1', '--json'))
+    assert.equal(drifted.contract, 'MODIFIED')
+    assert.notEqual(drifted.current_contract, drifted.sealed_contract)
+  } finally {
+    rmSync(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('a failed precondition is reported as INVALID and is untestable to bisect', { timeout: 120_000 }, () => {
+  const dir = path.join(os.tmpdir(), `repro-invalid-${process.pid}`, '.repro')
+  mkdirSync(dir, { recursive: true })
+  const spec = path.join(dir, 'repro.yaml')
+  writeFileSync(
+    spec,
+    [
+      'name: precondition-guard',
+      'base_url: http://localhost:3100',
+      'services:',
+      '  - command: npm run dev',
+      '    wait_for: { http: http://localhost:3100/health, timeout_ms: 30000 }',
+      'scenario:',
+      '  - name: impossible precondition',
+      '    http: { method: GET, url: /health }',
+      '    expect: { status: 999 }',
+      '  - name: checkout',
+      '    http: { method: POST, url: /api/checkout }',
+      'failure:',
+      '  step: checkout',
+      '  reproduce: { status: 500 }',
+      '',
+    ].join('\n'),
+  )
+  try {
+    const run = JSON.parse(cliOutput(['run', '--json', '--spec', spec, '--root', exampleRoot]))
+    assert.equal(run.status, 'invalid')
+    assert.match(run.error, /precondition failed/)
+
+    let code = 0
+    try {
+      execFileSync(process.execPath, [cli, 'run', '--exit-code', '--quiet', '--spec', spec, '--root', exampleRoot], { cwd: exampleRoot })
+    } catch (err) {
+      code = err.status
+    }
+    assert.equal(code, 125, 'an unreached target is untestable, not good')
+  } finally {
+    rmSync(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('an agent bug reproduces on its trace, with the trajectory as evidence', { timeout: 120_000 }, () => {
+  const run = JSON.parse(cliOutput(['run', '--json', '--spec', '.repro/agent.yaml']))
+  assert.equal(run.status, 'reproduced')
+  assert.match(run.failure.trajectory, /tool_call refund_order/)
+  assert.ok(
+    run.artifacts.some((a) => a.endsWith(path.join('traces', '01.json'))),
+    'the trace itself is the evidence and must be kept',
+  )
+
+  // Same contract, agent no longer taking the bug path.
+  const dir = path.join(os.tmpdir(), `repro-agent-${process.pid}`, '.repro')
+  mkdirSync(dir, { recursive: true })
+  const spec = path.join(dir, 'repro.yaml')
+  writeFileSync(
+    spec,
+    readFileSync(path.join(exampleRoot, '.repro', 'agent.yaml'), 'utf8').replace(
+      'AGENT_BUG_RATE: "1"',
+      'AGENT_BUG_RATE: "0"',
+    ),
+  )
+  try {
+    const fixed = JSON.parse(cliOutput(['run', '--json', '--spec', spec, '--root', exampleRoot]))
+    assert.equal(fixed.status, 'not_reproduced')
+    assert.match(fixed.failure.mismatch.join(' '), /no tool_call "refund_order"/)
+  } finally {
+    rmSync(path.dirname(dir), { recursive: true, force: true })
   }
 })
 

@@ -33,6 +33,7 @@ whichever one you use.
 - [The spec](#the-spec)
 - [Commands](#commands)
 - [Spec reference](#spec-reference)
+- [LLM agents](#llm-agents)
 - [Agent integration](#agent-integration)
 - [Evidence](#evidence)
 - [Try it](#try-it)
@@ -106,6 +107,8 @@ database, setup scripts — and writes:
 ├── repro.yaml     the reproduction spec (commit this)
 ├── COMPILE.md     briefing for your coding agent
 ├── report.md      the original bug report, when one was imported
+├── baseline.json  the measured reproduction rate (repro establish)
+├── seal.json      the frozen contract, baseline and environment (repro seal)
 ├── fixtures/
 ├── scripts/
 └── runs/          evidence bundles, one per run
@@ -235,12 +238,16 @@ Runs:
   17 reproduced
   3 passed
 Reproduction rate:
-  85%
+  85%   95% 64.0% – 94.8%
 Classification:
   FLAKY
 Confidence:
   HIGH
 ```
+
+The interval is a 95% Wilson score interval over the valid runs. `17/20` and
+`170/200` are both "85%" and are not the same measurement — a fix that moves 85%
+to 70% across twenty runs has moved nothing you can distinguish from noise.
 
 | rate | classification |
 | --- | --- |
@@ -256,6 +263,118 @@ times and see whether the rate actually moved.
 Services start once per invocation and setup steps run before each iteration, so
 `--repeat 20` does not mean twenty dev-server boots. Set `restart_services: true`
 when a run must not inherit any process state.
+
+### Four outcomes, not two
+
+Every run ends in exactly one of:
+
+| outcome | meaning |
+| --- | --- |
+| `reproduced` | every precondition held and the failure signature matched |
+| `not_reproduced` | every precondition held and the failure signature did not match |
+| `invalid` | the run never reached the failure step — a precondition failed, setup failed, or a service never came up |
+| `error` | repro itself could not execute the contract |
+
+The distinction that matters is `invalid`. If login breaks, the checkout bug was
+not reproduced — but it was not disproven either, and reporting that run as a
+pass is how a fix gets declared on a reproduction that never ran. `invalid` and
+`error` runs are excluded from the reproduction rate rather than counted as
+successes, and `--exit-code` reports both as `125` (untestable) so `git bisect`
+skips the commit instead of calling it good.
+
+### repro establish
+
+A single run is a story. A baseline is a measurement.
+
+```
+$ repro establish --repeat 100
+ESTABLISHED
+Runs:
+  100 total
+  98 valid
+  23 reproduced
+  2 invalid
+Reproduction rate:
+  23.5%   95% 16.2% – 32.7%
+Classification:
+  RARE
+Confidence:
+  HIGH
+Contract:
+  b831ac6f21b9
+```
+
+Writes `.repro/baseline.json`. For a deterministic bug this is a formality; for
+an intermittent one the recorded rate is the only thing a later verification has
+to compare against.
+
+### repro seal
+
+```
+$ repro seal
+REPRO SEALED
+Contract:
+  b831ac6f21b9
+Fixtures:
+  e3b0c44298fc
+Baseline:
+  23 / 98 valid runs  23.5%
+Environment:
+  linux 6.8.0  x64
+  node v20.11.0  repro 0.1.0
+  git 747cf5a
+  package-lock.json 4f2a91c
+```
+
+The seal hashes the bug definition — steps, failure signature, fixtures, scripts
+— together with the baseline and an environment fingerprint. `description` is
+prose about the bug rather than part of it, so rewording it does not break a
+seal; changing a matcher does.
+
+Sealing does not lock the file. It makes editing the file impossible to hide:
+
+```
+Contract:
+  MODIFIED
+  sealed:  b831ac6f21b9
+  current: 91dc223a70e4
+```
+
+Nothing is captured that should not be shared: the fingerprint holds platform,
+runtime and lockfile hashes, and never environment variables, credentials or
+tokens.
+
+### repro verify
+
+Run the sealed contract again after the fix.
+
+```
+$ repro verify --repeat 500
+Sealed baseline:
+  23 / 98 reproduced  23.5%   95% 16.2% – 32.7%
+Current:
+  1 / 500 reproduced  0.2%   95% 0.0% – 1.1%
+Contract:
+  UNCHANGED
+Elimination policy:
+  PASS
+```
+
+repro does not say "BUG FIXED" on its own. It reports that the rate moved from
+23.5% to 0.2% under an unchanged contract. Whether that is enough is a question
+the spec answers, not the tool:
+
+```yaml
+verify:
+  trials: 500
+  reproduced: { max: 0 }          # deterministic bugs
+  # reproduction_rate: { less_than: 0.01 }   # stochastic ones
+```
+
+With a policy declared, verify reports `PASS` or `FAIL` and exits `0` or `1`.
+Without one it reports the change and stops there. A modified contract exits `2`
+whatever the runs said, because the comparison is no longer between like and
+like.
 
 ### repro minimize
 
@@ -368,7 +487,7 @@ durable engineering asset instead of disappearing when the issue closes. Detects
 vitest or jest, falling back to `node:test`.
 
 ```
-Bug report -> reproduction -> minimized -> agent fix -> no longer reproduces -> regression test
+Bug report -> reproduction -> minimized -> sealed -> agent fix -> verified -> regression test
 ```
 
 
@@ -390,6 +509,7 @@ Bug report -> reproduction -> minimized -> agent fix -> no longer reproduces -> 
 | `teardown` | steps run after the scenario, always |
 | `restart_services` | restart services between repeated runs |
 | `stop_on_expect_fail` | abort the scenario at the first failed `expect` |
+| `verify` | elimination policy checked by `repro verify` |
 
 ### Steps
 
@@ -398,6 +518,7 @@ Bug report -> reproduction -> minimized -> agent fix -> no longer reproduces -> 
 | `shell` | `- shell: npm run seed` with optional `cwd` |
 | `http` | `- http: { method, url, headers, json / body / form, timeout_ms }` |
 | `browser` | `- browser: [ { goto: / }, { click: "#buy" } ]` |
+| `agent` | `- agent: { run: node agent.mjs, input: { message: "..." } }` |
 | `sleep` | `- sleep: 250` |
 
 Every step also accepts `id`, `name`, `expect`, `keep`, and `save`.
@@ -433,6 +554,10 @@ must hold.
 | `exit_code` | shell exit code |
 | `stdout_contains` / `stderr_contains` | shell output |
 | `logs_contain` | substring of the service or browser logs |
+| `trace` | agent trajectory — see [LLM agents](#llm-agents) |
+| `output` | agent final output: `equals`, `contains`, `matches`, `schema` |
+| `duration_ms` | how long the step took |
+| `usage` | `input_tokens`, `output_tokens`, `total_tokens` |
 
 ### Services
 
@@ -452,6 +577,112 @@ routinely fork children, and killing only the shell leaves the port bound so the
 next run silently talks to a stale process.
 
 
+## LLM agents
+
+An agent bug is not a different product. It is the same contract with a
+different observation: instead of a status code, the step produces a trace.
+
+```yaml
+scenario:
+  - id: request
+    agent:
+      run: node agents/support.mjs
+      input: { message: Please refund order 123 }
+      output_schema: .repro/schemas/refund-reply.json
+
+failure:
+  step: request
+  reproduce:
+    trace:
+      tool_call:
+        name: refund_order
+        arguments: { amount: { greater_than: 0 } }
+      sequence:
+        contains: [{ tool: refund_order }]
+        not_preceded_by: { tool: get_order }
+```
+
+That reads: the agent refunded, and it did so without ever looking the order up.
+
+### The trace
+
+repro has no SDK inside it and no framework integration. The agent is a process
+that prints JSON — one object, or JSONL, on stdout or into a file — and repro
+normalizes whatever it prints:
+
+```json
+{"type": "model",       "name": "planner",      "input": "refund order 123"}
+{"type": "tool_call",   "name": "refund_order", "input": {"order_id": "123", "amount": 4200}}
+{"type": "tool_result", "name": "refund_order", "output": {"ok": true}}
+{"type": "output", "output": {"status": "refunded"}, "usage": {"total_tokens": 960}}
+```
+
+Event types: `model`, `tool_call`, `tool_result`, `retrieval`, `handoff`,
+`message`, `custom`. `tool`/`name`, `arguments`/`input` and `result`/`output` are
+accepted as the same field, because frameworks disagree about the word. Lines
+that are not JSON are ignored, because agents log. The whole trace is also
+readable as JSON, so `json: { $.output.status: refunded }` and
+`save: { id: $.output.order_id }` work exactly as they do on an HTTP response.
+
+### What you can match
+
+| bug | matcher |
+| --- | --- |
+| wrong tool | `trace: { tool_call: { name: refund_order } }` |
+| wrong arguments | `arguments: { amount: { greater_than: 100 } }` |
+| missing required action | `sequence: { contains: [...], not_preceded_by: {...} }` |
+| looping | `tool_call: { name: web_search, count: { greater_than: 10 } }` |
+| cost or latency | `usage: { total_tokens: { greater_than: 50000 } }`, `duration_ms` |
+| malformed structured output | `output: { schema: { valid: false } }` |
+
+Comparators are `equals`, `not_equals`, `greater_than`,
+`greater_than_or_equal`, `less_than`, `less_than_or_equal`, `contains`,
+`matches`, `exists`, `missing`. An object whose keys are all comparators is a
+comparison; any other object is an expected value.
+
+### Stochastic bugs are still bugs
+
+Most agent failures are intermittent, which is exactly why `--repeat` and
+`establish` exist:
+
+```
+$ repro run --repeat 20 --spec .repro/agent.yaml
+Runs:
+  20 total
+  6 reproduced
+  14 passed
+Reproduction rate:
+  30%   95% 14.5% – 51.9%
+Classification:
+  RARE
+```
+
+A 30% bug is reproduced. `repro establish` records that rate, `repro seal`
+freezes it, and after the fix `repro verify --repeat 500` says whether it moved
+— against the interval, not against a single lucky run.
+
+### Reproduction, not replay
+
+repro runs the agent fresh every time. Replaying a recorded model output and a
+recorded tool response proves only that the recording still plays; it cannot
+tell you whether the agent would make the same bad decision again.
+
+The consequence to be aware of: the agent's tools run for real. Point the step
+at a harness whose tools are stubbed, or at a staging environment, before
+reproducing a bug whose failing step is `refund_customer`. Built-in tool
+virtualization — stub, record and replay modes with side effects captured
+rather than performed — is not implemented yet.
+
+### Semantic failures
+
+Some failures cannot be expressed structurally: "the assistant claimed a
+cancelled reservation was still active". Today, write that check as a `shell`
+step that reads the trace from the run directory and exits non-zero, and match
+on its `exit_code`. The order of preference is worth keeping: deterministic
+state, then structured output, then tool trajectory, then an executable check,
+and only then a model judging another model.
+
+
 ## Agent integration
 
 Any assistant that can run a shell command can use repro:
@@ -469,6 +700,9 @@ Any assistant that can run a shell command can use repro:
   "runs": 1,
   "failures": 1,
   "successes": 0,
+  "invalid": 0,
+  "errors": 0,
+  "interval": [0.2065, 1],
   "failure": {
     "step": "checkout",
     "step_index": 12,
@@ -482,12 +716,22 @@ Any assistant that can run a shell command can use repro:
 ```
 
 Every command takes `--json`. `repro run --exit-code` follows the git bisect
-contract: `0` good, `1` reproduced, `125` untestable.
+contract: `0` good, `1` reproduced, `125` untestable — which includes an
+`invalid` run, so a commit whose preconditions never held is skipped rather than
+called good.
+
+The stronger agent loop seals the contract first, so the agent cannot move the
+goalposts while working:
+
+```bash
+repro establish --repeat 20 && repro seal   # before the fix
+repro verify                                # after it
+```
 
 repro is also importable as a library:
 
 ```js
-import { loadSpec, runReproduction, minimize, explain } from 'repro'
+import { loadSpec, runReproduction, minimize, explain, establish, seal, verify } from 'repro'
 
 const loaded = await loadSpec()
 const result = await runReproduction(loaded, { repeat: 20 })
@@ -527,11 +771,18 @@ node ../dist/cli.js run                             # reproduces
 node ../dist/cli.js run --repeat 10                 # deterministic
 node ../dist/cli.js minimize                        # 12 steps -> 5
 node ../dist/cli.js explain                         # boundary and state diff
+node ../dist/cli.js establish --repeat 10            # baseline
+node ../dist/cli.js seal                            # freeze the contract
+node ../dist/cli.js verify                          # FAIL: the bug is still there
 node ../dist/cli.js run --spec .repro/browser.yaml  # same bug through the UI
+node ../dist/cli.js run --spec .repro/agent.yaml    # an agent bug, matched on its trace
 ```
 
 Set `FLAKY_RATE=0.7` on the example server to watch `--repeat` classify an
-intermittent failure.
+intermittent failure. The agent example ships a support agent that skips an
+order lookup and refunds an already-refunded order; drop `AGENT_BUG_RATE` in
+`.repro/agent.yaml` to 0.35 and run `--repeat 20` to see a stochastic bug
+measured rather than argued about.
 
 
 ## Design principles
@@ -548,6 +799,10 @@ so nothing in the execution path is one.
 **Human inspectable.** The spec is a YAML file you can read, edit and review.
 There is no hidden state.
 
+**The contract outlives the implementation.** The code changes; the definition of
+the bug does not. A seal makes any change to that definition visible instead of
+preventing it.
+
 **Evidence over claims.** Not "I think I reproduced it" — `20/20 runs`, a trace,
 and a diff.
 
@@ -559,6 +814,12 @@ replacement, a unit test replacement, a CI platform, an observability platform,
 or an agent orchestrator. It has one responsibility: turn bugs into executable
 reproductions.
 
+It is also not an eval framework. An eval asks how well a system performs across
+a distribution of tasks. repro asks under which conditions one reported failure
+can be observed. There is no helpfulness score, no quality score, no model
+ranking — a score only exists here when it is literally the failure signature of
+a particular bug.
+
 
 ## Development
 
@@ -569,8 +830,9 @@ npm test          # 26 tests, including end-to-end reproduce/minimize/explain
 bash docs/demo.sh # regenerate the demo recording
 ```
 
-The MVP targets JavaScript and TypeScript web applications; the execution layer
-is deliberately separated from the ecosystem so others can be added.
+The MVP targets JavaScript and TypeScript web applications and any agent that
+can print a JSON trace; the execution layer is deliberately separated from the
+ecosystem so others can be added.
 
 
 ## License

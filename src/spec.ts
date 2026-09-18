@@ -8,6 +8,15 @@ import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import YAML from 'yaml'
+import {
+  matchAgent,
+  type AgentMatcher,
+  type AgentStep,
+  type AgentTrace,
+  type NumberMatcher,
+  type OutputMatcher,
+  type TraceMatcher,
+} from './agent.js'
 
 // ---------------------------------------------------------------- matchers
 
@@ -27,6 +36,11 @@ export type Matcher = {
   stdout_contains?: string
   stderr_contains?: string
   logs_contain?: string
+  /** Agent steps: the normalized trace. See agent.ts. */
+  trace?: TraceMatcher
+  output?: OutputMatcher
+  duration_ms?: NumberMatcher
+  usage?: AgentMatcher['usage']
 }
 
 /** Uniform outcome shape across every step kind, so one Matcher covers all. */
@@ -46,11 +60,14 @@ export type Observed = {
   /** Set when the step declared `expect` and the observation did not match. */
   expect_failed?: string[]
   screenshots?: string[]
+  /** Other files this step left behind (agent traces, dumps). */
+  artifacts?: string[]
+  trace?: AgentTrace
 }
 
 // ------------------------------------------------------------------- steps
 
-export type StepKind = 'shell' | 'http' | 'browser' | 'sleep'
+export type StepKind = 'shell' | 'http' | 'browser' | 'sleep' | 'agent'
 
 export type HttpReq = {
   method?: string
@@ -81,6 +98,7 @@ export type Step = StepCommon & {
   http?: HttpReq
   browser?: BrowserAction[]
   sleep?: number
+  agent?: AgentStep
 }
 
 // ---------------------------------------------------------------- services
@@ -111,6 +129,18 @@ export type FailureSpec = {
   reproduce: Matcher
 }
 
+/**
+ * What counts as "this failure no longer happens". Without one, repro reports
+ * a rate change and refuses to call a bug fixed — that call belongs to a
+ * declared policy, not to a verdict printer.
+ */
+export type VerifyPolicy = {
+  /** Runs `repro verify` performs when --repeat is not given. */
+  trials?: number
+  reproduced?: { max?: number }
+  reproduction_rate?: { less_than?: number; less_than_or_equal?: number }
+}
+
 export type Spec = {
   name: string
   description?: string
@@ -127,7 +157,28 @@ export type Spec = {
   restart_services?: boolean
   /** Abort the scenario as soon as a step's `expect` fails. */
   stop_on_expect_fail?: boolean
+  /** Elimination policy checked by `repro verify`. */
+  verify?: VerifyPolicy
 }
+
+/**
+ * The parts of the spec that define the bug. `description` is prose about the
+ * bug, not part of it, so editing it does not break a seal.
+ */
+export const CONTRACT_KEYS = [
+  'name',
+  'base_url',
+  'env',
+  'vars',
+  'setup',
+  'services',
+  'scenario',
+  'failure',
+  'teardown',
+  'restart_services',
+  'stop_on_expect_fail',
+  'verify',
+] as const
 
 export class SpecError extends Error {}
 
@@ -202,7 +253,7 @@ export function validateSpec(raw: unknown, where = 'repro.yaml'): Spec {
     const kind = stepKindOf(step)
     if (!kind) {
       problems.push(
-        `scenario[${i}]: no executable key — expected one of shell, http, browser, sleep`,
+        `scenario[${i}]: no executable key — expected one of shell, http, browser, sleep, agent`,
       )
     }
   })
@@ -221,6 +272,7 @@ export function stepKindOf(step: unknown): StepKind | undefined {
   if (s.http && typeof s.http === 'object') return 'http'
   if (Array.isArray(s.browser)) return 'browser'
   if (typeof s.sleep === 'number') return 'sleep'
+  if (s.agent && typeof s.agent === 'object') return 'agent'
   return undefined
 }
 
@@ -236,6 +288,16 @@ export function stepLabel(step: Step, index: number): string {
     const first = step.browser[0]
     const key = first ? Object.keys(first)[0] : undefined
     return `browser (${step.browser.length} actions${key ? `, ${key}…` : ''})`
+  }
+  if (step.agent) {
+    const input = step.agent.input
+    const summary =
+      typeof input === 'string'
+        ? input
+        : typeof (input as { message?: string })?.message === 'string'
+          ? (input as { message: string }).message
+          : (step.agent.run ?? step.agent.trace_file ?? 'trace')
+    return `agent: ${summary.slice(0, 60)}`
   }
   if (typeof step.sleep === 'number') return `sleep ${step.sleep}ms`
   return `step ${index + 1}`
@@ -360,6 +422,9 @@ export function matchOutcome(m: Matcher, o: Observed, logs = ''): MatchResult {
   }
   if (m.logs_contain !== undefined && !logs.includes(m.logs_contain) && !streams.includes(m.logs_contain)) {
     reasons.push(`service logs do not contain ${JSON.stringify(m.logs_contain)}`)
+  }
+  if (m.trace || m.output || m.duration_ms !== undefined || m.usage) {
+    reasons.push(...matchAgent(m, o.trace, o.duration_ms))
   }
 
   return { ok: reasons.length === 0, reasons }

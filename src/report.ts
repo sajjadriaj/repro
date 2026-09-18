@@ -1,6 +1,7 @@
 /** Human-readable rendering. Agent-readable output goes through --json. */
 import path from 'node:path'
 import type { RepeatResult } from './run.js'
+import type { Baseline, Seal, VerifyReport } from './seal.js'
 import type { MinimizeResult } from './minimize.js'
 import type { ExplainReport } from './explain.js'
 
@@ -29,11 +30,22 @@ export function renderRun(result: RepeatResult, cwd = process.cwd()): string {
   const verdict =
     result.status === 'reproduced'
       ? red(bold('FAILURE REPRODUCED'))
-      : result.status === 'error'
-        ? yellow(bold('RUN ERROR'))
-        : green(bold('NOT REPRODUCED'))
+      : result.status === 'invalid'
+        ? yellow(bold('INVALID'))
+        : result.status === 'error'
+          ? yellow(bold('RUN ERROR'))
+          : green(bold('NOT REPRODUCED'))
   lines.push('', verdict)
 
+  if (result.status === 'invalid') {
+    lines.push(
+      field(
+        'Target never reached:',
+        result.error ?? 'a precondition did not hold, so the failure was never observable',
+      ),
+      dim('  this is not evidence that the bug is gone.'),
+    )
+  }
   if (result.error && result.status === 'error') lines.push(field('Error:', result.error))
 
   const f = result.failure
@@ -55,11 +67,12 @@ export function renderRun(result: RepeatResult, cwd = process.cwd()): string {
           `${result.runs} total`,
           `${result.failures} reproduced`,
           `${result.successes} passed`,
+          ...(result.invalid ? [`${result.invalid} invalid`] : []),
           ...(result.errors ? [`${result.errors} errored`] : []),
         ].join('\n'),
       ),
     )
-    lines.push(field('Reproduction rate:', `${Math.round(result.reproduction_rate * 100)}%`))
+    lines.push(field('Reproduction rate:', rateLine(result.reproduction_rate, result.interval)))
     lines.push(field('Classification:', classificationColor(result)))
   } else {
     lines.push(field('Reproduction:', `${result.failures} / ${result.failures + result.successes} runs`))
@@ -94,6 +107,7 @@ export function describeMatcher(m: Record<string, unknown>): string {
 
 function describeObserved(f: NonNullable<RepeatResult['failure']>): string {
   const parts: string[] = []
+  if (f.observed.trajectory) return f.observed.trajectory
   if (f.observed.status !== undefined) parts.push(String(f.observed.status))
   if (f.observed.exit_code !== undefined) parts.push(`exit ${f.observed.exit_code}`)
   if (f.observed.error) parts.push(f.observed.error)
@@ -177,5 +191,125 @@ export function renderExplain(report: ExplainReport): string {
     '',
     dim('repro reports where behaviour diverges. Diagnosing why is the agent’s job.'),
   )
+  return lines.join('\n')
+}
+
+
+// -------------------------------------------------- establish / seal / verify
+
+/** A rate on its own overstates a small sample; the interval says how small. */
+export function rateLine(rate: number, interval: [number, number]): string {
+  return `${pct(rate)}${dim(`   95% ${pct(interval[0])} – ${pct(interval[1])}`)}`
+}
+
+export function pct(value: number): string {
+  return `${Number((value * 100).toFixed(1))}%`
+}
+
+export function renderEstablish(baseline: Baseline): string {
+  const lines = ['', bold(baseline.reproduced > 0 ? 'ESTABLISHED' : 'NOT ESTABLISHED')]
+  lines.push(
+    field(
+      'Runs:',
+      [
+        `${baseline.runs} total`,
+        `${baseline.valid} valid`,
+        `${baseline.reproduced} reproduced`,
+        ...(baseline.invalid ? [`${baseline.invalid} invalid`] : []),
+        ...(baseline.errors ? [`${baseline.errors} errored`] : []),
+      ].join('\n'),
+    ),
+  )
+  lines.push(field('Reproduction rate:', rateLine(baseline.reproduction_rate, baseline.interval)))
+  lines.push(field('Classification:', baseline.classification))
+  lines.push(field('Confidence:', baseline.confidence))
+  lines.push(field('Contract:', baseline.contract.slice(0, 12)))
+  if (baseline.reproduced === 0) {
+    lines.push(
+      '',
+      yellow('the failure was never observed, so there is no baseline to seal.'),
+    )
+  }
+  return lines.join('\n')
+}
+
+export function renderSeal(sealed: Seal): string {
+  const lines = ['', bold('REPRO SEALED')]
+  lines.push(field('Contract:', sealed.contract.slice(0, 12)))
+  lines.push(field('Fixtures:', sealed.fixtures.slice(0, 12)))
+  lines.push(
+    field(
+      'Baseline:',
+      `${sealed.baseline.reproduced} / ${sealed.baseline.valid} valid runs  ${dim(
+        pct(sealed.baseline.reproduction_rate),
+      )}`,
+    ),
+  )
+  const env = sealed.environment
+  lines.push(
+    field(
+      'Environment:',
+      [
+        `${env.os}  ${env.arch}`,
+        `node ${env.node}  repro ${env.repro}`,
+        ...(env.git_commit ? [`git ${env.git_commit}${env.git_dirty ? ' (dirty)' : ''}`] : []),
+        ...Object.entries(env.locks).map(([name, hash]) => `${name} ${hash}`),
+      ].join('\n'),
+    ),
+  )
+  return lines.join('\n')
+}
+
+export function renderVerify(report: VerifyReport): string {
+  const lines: string[] = ['']
+  const b = report.baseline
+  const c = report.current
+  lines.push(
+    field(
+      'Sealed baseline:',
+      `${b.reproduced} / ${b.valid} reproduced  ${rateLine(b.reproduction_rate, b.interval)}`,
+    ),
+  )
+  lines.push(
+    field(
+      'Current:',
+      [
+        `${c.reproduced} / ${c.valid} reproduced  ${rateLine(c.reproduction_rate, c.interval)}`,
+        ...(c.invalid ? [yellow(`${c.invalid} runs invalid — the target was not reached`)] : []),
+        ...(c.errors ? [yellow(`${c.errors} runs errored`)] : []),
+      ].join('\n'),
+    ),
+  )
+  lines.push(
+    field(
+      'Contract:',
+      report.contract === 'UNCHANGED'
+        ? green('UNCHANGED')
+        : red(
+            `MODIFIED\nsealed:  ${report.sealed_contract.slice(0, 12)}\ncurrent: ${report.current_contract.slice(0, 12)}`,
+          ),
+    ),
+  )
+  if (report.fixtures === 'MODIFIED') lines.push(field('Fixtures:', red('MODIFIED')))
+  if (report.environment_drift.length) {
+    lines.push(field('Environment drift:', dim(report.environment_drift.join('\n'))))
+  }
+  if (report.policy) {
+    lines.push(
+      field(
+        'Elimination policy:',
+        report.policy.result === 'PASS'
+          ? green('PASS')
+          : `${red('FAIL')}\n${report.policy.reasons.join('\n')}`,
+      ),
+    )
+  } else {
+    lines.push(
+      '',
+      dim(
+        'no `verify:` policy declared, so repro reports the change and stops short\nof calling the bug fixed.',
+      ),
+    )
+  }
   return lines.join('\n')
 }

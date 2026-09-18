@@ -1,0 +1,45 @@
+# An agent reproduction. Same file format, same verdicts, same evidence —
+# the only new thing is that the observation is a trace.
+#
+# Bug report:
+#   "Support agent sometimes refunds an order that was already refunded."
+name: support-double-refund
+description: The support agent skips the order lookup and refunds an already-refunded order
+
+scenario:
+  - id: request
+    name: ask for a refund on an already-refunded order
+    agent:
+      run: node agents/support.mjs
+      input:
+        message: Please refund order 123
+      output_schema: .repro/schemas/refund-reply.json
+      timeout_ms: 30000
+      # A real agent samples; this one takes the bug path on every run so the
+      # shipped example is demonstrable. Lower it to watch --repeat measure a
+      # stochastic bug instead.
+      env:
+        AGENT_BUG_RATE: "1"
+
+# What "reproduced" means for this bug: the agent refunded, and it did so
+# without ever looking the order up.
+failure:
+  step: request
+  expect:
+    json:
+      $.output.status: declined_already_refunded
+  reproduce:
+    trace:
+      tool_call:
+        name: refund_order
+        arguments:
+          amount: { greater_than: 0 }
+      sequence:
+        contains:
+          - tool: refund_order
+        not_preceded_by:
+          tool: get_order
+
+verify:
+  trials: 50
+  reproduced: { max: 0 }

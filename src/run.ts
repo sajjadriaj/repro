@@ -21,7 +21,21 @@ import {
 import { newRunDir, type NetworkEntry, type RunDir } from './evidence.js'
 import { closeBrowser, runStep, startServices, type ExecContext, type ServiceHandle } from './exec.js'
 
-export type RunStatus = 'reproduced' | 'not_reproduced' | 'error'
+/**
+ * Four outcomes, never three. INVALID (a precondition never held, so the
+ * target condition was never reached) is not evidence that the bug is gone,
+ * and ERROR (repro itself could not execute the contract) is not evidence of
+ * anything at all. Collapsing either into the other lets a broken login read
+ * as a fixed checkout.
+ */
+export type RunStatus = 'reproduced' | 'not_reproduced' | 'invalid' | 'error'
+
+/**
+ * Thrown when the system under test could not be brought to the point where
+ * the failure signature is even observable: setup failed, a service never came
+ * up, a precondition step did not hold. The run is INVALID, not ERROR.
+ */
+export class PreconditionError extends Error {}
 
 export type FailureReport = {
   step: string
@@ -33,6 +47,8 @@ export type FailureReport = {
     exception?: string
     error?: string
     body_excerpt?: string
+    /** Agent steps: what the agent actually did, in order. */
+    trajectory?: string
   }
   /** Why the reproduce matcher did not match (empty when it did). */
   mismatch: string[]
@@ -71,8 +87,13 @@ export type RepeatResult = {
   failures: number
   /** Runs in which the application behaved. */
   successes: number
+  /** Runs that never reached the failure step. Excluded from the rate. */
+  invalid: number
   errors: number
+  /** reproduced / (reproduced + not_reproduced). INVALID and ERROR never count. */
   reproduction_rate: number
+  /** 95% Wilson interval for the observed rate, over valid runs. */
+  interval: [number, number]
   classification: 'DETERMINISTIC' | 'FLAKY' | 'RARE' | 'NOT REPRODUCED'
   confidence: 'HIGH' | 'MEDIUM' | 'LOW'
   failure?: FailureReport
@@ -146,6 +167,7 @@ export async function executeOnce(
 
   const steps: Observed[] = []
   let error: string | undefined
+  let unreachable = false
 
   try {
     // 1. Environment
@@ -156,7 +178,9 @@ export async function executeOnce(
         if (observed.error || (observed.exit_code !== undefined && observed.exit_code !== 0)) {
           const detail = observed.error ?? `${stepLabel(step, i)} exited ${observed.exit_code}`
           opts.onPhase?.('Environment', 'fail', detail)
-          throw new Error(`setup step failed: ${detail}\n${(observed.stderr ?? '').slice(-1000)}`)
+          throw new PreconditionError(
+            `setup step failed: ${detail}\n${(observed.stderr ?? '').slice(-1000)}`,
+          )
         }
       }
       opts.onPhase?.('Environment', 'pass')
@@ -166,12 +190,17 @@ export async function executeOnce(
     if (spec.services?.length) {
       if (!holder) {
         opts.onPhase?.('Services', 'start')
-        ownServices = await startServices(spec.services, {
-          root,
-          env: spec.env ?? {},
-          baseUrl: spec.base_url,
-          vars: ctx.vars,
-        })
+        try {
+          ownServices = await startServices(spec.services, {
+            root,
+            env: spec.env ?? {},
+            baseUrl: spec.base_url,
+            vars: ctx.vars,
+          })
+        } catch (err) {
+          opts.onPhase?.('Services', 'fail', message(err))
+          throw new PreconditionError(`service failed to start: ${message(err)}`)
+        }
         opts.onPhase?.('Services', 'pass')
       } else {
         if (!holder.handle) {
@@ -185,7 +214,7 @@ export async function executeOnce(
             })
           } catch (err) {
             opts.onPhase?.('Services', 'fail', message(err))
-            throw err
+            throw new PreconditionError(`service failed to start: ${message(err)}`)
           }
           opts.onPhase?.('Services', 'pass')
         }
@@ -203,6 +232,7 @@ export async function executeOnce(
     opts.onPhase?.('Scenario', 'pass')
   } catch (err) {
     error = message(err)
+    unreachable = err instanceof PreconditionError
   } finally {
     await closeBrowser(ctx)
     for (const step of spec.teardown ?? []) {
@@ -213,7 +243,7 @@ export async function executeOnce(
   }
 
   const logs = ctx.serviceLogs()
-  const verdict = evaluate(spec, steps, logs, error)
+  const verdict = evaluate(spec, steps, logs, error, unreachable)
   const result: RunResult = {
     status: verdict.status,
     run_id: run.id,
@@ -236,6 +266,7 @@ export async function executeOnce(
     run.file('result.json'),
     ...(network.length ? [run.file('network.json')] : []),
     ...steps.flatMap((s) => s.screenshots ?? []),
+    ...steps.flatMap((s) => s.artifacts ?? []),
   ]
   // network lives in network.json; duplicating it into result.json doubles the
   // bundle for no gain.
@@ -251,8 +282,9 @@ function evaluate(
   steps: Observed[],
   logs: string,
   hardError: string | undefined,
+  unreachable = false,
 ): { status: RunStatus; failure?: FailureReport; error?: string } {
-  if (hardError) return { status: 'error', error: hardError }
+  if (hardError) return { status: unreachable ? 'invalid' : 'error', error: hardError }
 
   let failIdx: number
   try {
@@ -264,7 +296,7 @@ function evaluate(
   const observed = steps[failIdx]
   if (!observed) {
     return {
-      status: 'error',
+      status: 'invalid',
       error: `scenario stopped before reaching the failure step (${failIdx + 1}/${spec.scenario.length})`,
     }
   }
@@ -275,7 +307,7 @@ function evaluate(
     const prior = steps[i]
     if (prior?.expect_failed) {
       return {
-        status: 'error',
+        status: 'invalid',
         error: `precondition failed at step ${i + 1} (${prior.label}): ${prior.expect_failed.join('; ')}`,
       }
     }
@@ -292,10 +324,20 @@ function evaluate(
       exception: observed.exception,
       error: observed.error,
       body_excerpt: excerpt(observed.body),
+      trajectory: trajectory(observed),
     },
     mismatch: match.reasons,
   }
   return { status: match.ok ? 'reproduced' : 'not_reproduced', failure: report }
+}
+
+/** A trace is evidence; a verdict without it says nothing about what happened. */
+function trajectory(observed: Observed): string | undefined {
+  const events = observed.trace?.events
+  if (!events?.length) return undefined
+  const shown = events.slice(0, 12).map((e) => (e.name ? `${e.type} ${e.name}` : e.type))
+  if (events.length > shown.length) shown.push(`… ${events.length - shown.length} more`)
+  return shown.join(' → ')
 }
 
 function excerpt(body: string | undefined, max = 400): string | undefined {
@@ -309,12 +351,21 @@ function excerpt(body: string | undefined, max = 400): string | undefined {
 export function aggregate(spec: Spec, results: RunResult[], fatal?: string): RepeatResult {
   const failures = results.filter((r) => r.status === 'reproduced').length
   const successes = results.filter((r) => r.status === 'not_reproduced').length
+  const invalid = results.filter((r) => r.status === 'invalid').length
   const errors = results.filter((r) => r.status === 'error').length
   const valid = failures + successes
   const rate = valid === 0 ? 0 : failures / valid
 
+  // With no valid run there is no measurement, so the aggregate reports why
+  // rather than pretending the bug is gone.
   const status: RunStatus =
-    failures > 0 ? 'reproduced' : valid === 0 ? 'error' : 'not_reproduced'
+    failures > 0
+      ? 'reproduced'
+      : valid > 0
+        ? 'not_reproduced'
+        : invalid > 0
+          ? 'invalid'
+          : 'error'
 
   const reproduced = results.find((r) => r.status === 'reproduced')
   const anyFailure = reproduced ?? results.find((r) => r.failure)
@@ -325,8 +376,10 @@ export function aggregate(spec: Spec, results: RunResult[], fatal?: string): Rep
     runs: results.length,
     failures,
     successes,
+    invalid,
     errors,
     reproduction_rate: Number(rate.toFixed(4)),
+    interval: wilson(failures, valid),
     classification: classify(rate, valid),
     confidence: confidenceOf(rate, valid),
     failure: anyFailure?.failure,
@@ -334,6 +387,23 @@ export function aggregate(spec: Spec, results: RunResult[], fatal?: string): Rep
     artifacts: (reproduced ?? results.at(-1))?.artifacts ?? [],
     runs_detail: results.map((r) => ({ id: r.run_id, status: r.status, duration_ms: r.duration_ms })),
   }
+}
+
+/**
+ * 95% Wilson score interval. Reported instead of a bare percentage because
+ * "3/10 reproduced" and "300/1000 reproduced" are not the same measurement,
+ * and a fix that moves 30% to 20% on ten runs has moved nothing.
+ */
+export function wilson(successes: number, trials: number): [number, number] {
+  if (trials === 0) return [0, 0]
+  const z = 1.959964
+  const p = successes / trials
+  const d = 1 + (z * z) / trials
+  const centre = p + (z * z) / (2 * trials)
+  const spread = z * Math.sqrt((p * (1 - p)) / trials + (z * z) / (4 * trials * trials))
+  const lo = Math.max(0, (centre - spread) / d)
+  const hi = Math.min(1, (centre + spread) / d)
+  return [Number(lo.toFixed(4)), Number(hi.toFixed(4))]
 }
 
 export function classify(rate: number, validRuns: number): RepeatResult['classification'] {

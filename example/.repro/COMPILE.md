@@ -66,6 +66,15 @@ scenario:
       - wait_for: "#error"
       - screenshot: after-submit
 
+  # agent — anything that prints a JSON or JSONL trace on stdout
+  - id: request
+    agent:
+      run: node agents/support.mjs
+      input: { message: "Please refund order 123" }
+      output_schema: .repro/schemas/reply.json   # optional
+      env: { TEMPERATURE: "0.7" }
+      # trace_file: .repro/traces/captured.jsonl  # instead of, or as well as run
+
   # pause
   - sleep: 250
 ```
@@ -76,12 +85,34 @@ scenario:
 `json` (map of `$.path` to expected value), `exception`, `exit_code`,
 `stdout_contains`, `stderr_contains`, `logs_contain`.
 
+For agent steps, also `trace`, `output`, `duration_ms` and `usage`:
+
+```yaml
+reproduce:
+  trace:
+    tool_call:
+      name: refund_order
+      arguments: { amount: { greater_than: 100 } }
+      count: { greater_than: 10 }        # omit for "at least once"
+    sequence:
+      contains: [{ tool: transfer_money }]
+      not_preceded_by: { tool: verify_identity }
+  output: { schema: { valid: false } }   # needs output_schema on the step
+  usage: { total_tokens: { greater_than: 50000 } }
+  duration_ms: { greater_than: 10000 }
+```
+
+Comparators: `equals`, `not_equals`, `greater_than`, `greater_than_or_equal`,
+`less_than`, `less_than_or_equal`, `contains`, `matches`, `exists`, `missing`.
+An agent step's whole trace also reads as JSON: `json: { $.output.status: ok }`
+in a matcher, `save: { id: $.output.order_id }` to capture from it.
+
 ### Rules that matter
 
 - `failure.reproduce` defines "reproduced". Make it specific — `{ status: 500 }`
   alone will also match an unrelated crash.
 - An `expect` on a step *before* the failure step is a precondition. If it
-  fails, the run is reported as an error, not as a reproduction. Use this to
+  fails, the run is reported as invalid, not as a reproduction. Use this to
   stop the minimizer from deleting steps that silently matter.
 - Mark a step `keep: true` to protect it from the minimizer.
 - `failure.step` selects the failing step by id, name, or 1-based index.

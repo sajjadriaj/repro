@@ -10,8 +10,23 @@ import { runReproduction, type RepeatResult } from './run.js'
 import { minimize } from './minimize.js'
 import { explain } from './explain.js'
 import { bisect } from './bisect.js'
+import { establish, seal, SealError, verify } from './seal.js'
 import { detectProject, importEvidence, scaffold, type Imported } from './compile.js'
-import { bold, cyan, dim, green, phaseLine, red, renderExplain, renderMinimize, renderRun, yellow } from './report.js'
+import {
+  bold,
+  cyan,
+  dim,
+  green,
+  phaseLine,
+  red,
+  renderEstablish,
+  renderExplain,
+  renderMinimize,
+  renderRun,
+  renderSeal,
+  renderVerify,
+  yellow,
+} from './report.js'
 
 const VERSION = '0.1.0'
 
@@ -69,6 +84,12 @@ async function main(argv: string[]): Promise<number> {
       return cmdFrom(rest, flags)
     case 'run':
       return cmdRun(flags)
+    case 'establish':
+      return cmdEstablish(flags)
+    case 'seal':
+      return cmdSeal(flags)
+    case 'verify':
+      return cmdVerify(flags)
     case 'minimize':
       return cmdMinimize(flags)
     case 'explain':
@@ -196,8 +217,9 @@ async function cmdRun(flags: Flags): Promise<number> {
   else process.stdout.write(`${renderRun(result)}\n\n`)
 
   if (flags['exit-code']) {
-    // git-bisect contract: 0 = good, 1 = bad, 125 = untestable.
-    if (result.status === 'error') return 125
+    // git-bisect contract: 0 = good, 1 = bad, 125 = untestable. A run that
+    // never reached the failure step is untestable, not good.
+    if (result.status === 'error' || result.status === 'invalid') return 125
     return result.status === 'reproduced' ? 1 : 0
   }
   return 0
@@ -214,7 +236,9 @@ function toJson(result: RepeatResult) {
     runs: result.runs,
     failures: result.failures,
     successes: result.successes,
+    invalid: result.invalid,
     errors: result.errors,
+    interval: result.interval,
     failure: result.failure
       ? {
           step: result.failure.step,
@@ -222,12 +246,82 @@ function toJson(result: RepeatResult) {
           expected_status: (result.failure.expected as { status?: number } | undefined)?.status,
           actual_status: result.failure.observed.status,
           exception: result.failure.observed.exception ?? result.failure.observed.error,
+          trajectory: result.failure.observed.trajectory,
           mismatch: result.failure.mismatch,
         }
       : undefined,
     error: result.error,
     artifacts: result.artifacts,
   }
+}
+
+// ------------------------------------------------- establish / seal / verify
+
+async function cmdEstablish(flags: Flags): Promise<number> {
+  const loaded = await load(flags)
+  const quiet = flags.quiet === true || flags.json === true
+  if (!quiet) process.stdout.write(`${bold('ESTABLISH')} ${loaded.spec.name}\n`)
+
+  const { baseline, path: file } = await establish(loaded, {
+    // A single run is a story, not a baseline.
+    repeat: num(flags.repeat) ?? 10,
+    timeoutMs: num(flags.timeout),
+    version: VERSION,
+    onPhase: (phase, status, detail) => {
+      if (quiet || status === 'start') return
+      process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
+    },
+  })
+
+  if (flags.json) process.stdout.write(`${JSON.stringify(baseline, null, 2)}\n`)
+  else {
+    process.stdout.write(`${renderEstablish(baseline)}\n`)
+    const rel = path.relative(process.cwd(), file) || file
+    process.stdout.write(
+      `\nwrote ${cyan(rel)}${dim(baseline.reproduced > 0 ? '  (now: repro seal)' : '')}\n\n`,
+    )
+  }
+  return baseline.reproduced > 0 ? 0 : 1
+}
+
+async function cmdSeal(flags: Flags): Promise<number> {
+  const loaded = await load(flags)
+  const { seal: sealed, path: file } = await seal(loaded, VERSION)
+  if (flags.json) process.stdout.write(`${JSON.stringify(sealed, null, 2)}\n`)
+  else {
+    process.stdout.write(`${renderSeal(sealed)}\n`)
+    const rel = path.relative(process.cwd(), file) || file
+    process.stdout.write(
+      `\nwrote ${cyan(rel)}\n${dim('commit it. the implementation may now change; this definition may not.')}\n\n`,
+    )
+  }
+  return 0
+}
+
+async function cmdVerify(flags: Flags): Promise<number> {
+  const loaded = await load(flags)
+  const quiet = flags.quiet === true || flags.json === true
+  if (!quiet) process.stdout.write(`${bold('VERIFY')} ${loaded.spec.name}\n`)
+
+  const report = await verify(loaded, {
+    repeat: num(flags.repeat),
+    timeoutMs: num(flags.timeout),
+    version: VERSION,
+    onPhase: (phase, status, detail) => {
+      if (quiet || status === 'start') return
+      process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
+    },
+  })
+
+  if (flags.json) {
+    const { result: _full, ...summary } = report
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`)
+  } else process.stdout.write(`${renderVerify(report)}\n\n`)
+
+  // A modified contract invalidates the comparison whatever the runs said.
+  if (report.contract === 'MODIFIED' || report.fixtures === 'MODIFIED') return 2
+  if (report.policy) return report.policy.result === 'PASS' ? 0 : 1
+  return report.current.reproduced > 0 ? 1 : 0
 }
 
 // ---------------------------------------------------------------- minimize
@@ -457,13 +551,16 @@ ${bold('COMMANDS')}
   init <description>     Inspect the repo and scaffold .repro/repro.yaml
   from <file>            Same, seeded from evidence (.md .log .har .curl .txt)
   run                    Execute the reproduction and report a verdict
+  establish              Measure the failure repeatedly and record a baseline
+  seal                   Freeze the contract, baseline and environment
+  verify                 Re-run the sealed contract and compare
   minimize               Cut the scenario to the steps that actually matter
   explain                Locate the failure boundary and collect evidence
   bisect                 Find the commit that introduced the failure
   export --test          Emit a regression test from the reproduction
 
 ${bold('OPTIONS')}
-  --repeat <n>           Run n times; measures flakiness          (run, bisect)
+  --repeat <n>           Run n times; measures flakiness  (run, establish, verify, bisect)
   --json                 Machine-readable output                  (all)
   --exit-code            Exit 1 when reproduced, 125 on error     (run)
   --confirm <n>          Runs required per probe                  (minimize, explain)
@@ -482,6 +579,8 @@ ${bold('EXAMPLES')}
   repro init "checkout returns 500 after changing address and applying SAVE20"
   repro from bug-report.md
   repro run --repeat 20
+  repro establish --repeat 100 && repro seal
+  repro verify --repeat 500  ${dim('# same contract, after the fix')}
   repro minimize --write
   repro explain
   repro bisect --good v2.4.1 --bad HEAD
@@ -503,7 +602,7 @@ if (invokedDirectly) {
     .catch((err: unknown) => {
       const detail = err instanceof Error ? err.message : String(err)
       process.stderr.write(`${red('error:')} ${detail}\n`)
-      process.exitCode = err instanceof SpecError ? 2 : 1
+      process.exitCode = err instanceof SpecError || err instanceof SealError ? 2 : 1
     })
 }
 

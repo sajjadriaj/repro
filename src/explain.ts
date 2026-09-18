@@ -73,7 +73,9 @@ export async function explain(
       notes.push(
         bad.status === 'error'
           ? `the run errored (${bad.error ?? 'unknown'}), so boundary analysis was skipped`
-          : 'the bug did not reproduce on this run, so boundary analysis was skipped',
+          : bad.status === 'invalid'
+            ? `the run never reached the failure step (${bad.error ?? 'a precondition failed'}), so boundary analysis was skipped`
+            : 'the bug did not reproduce on this run, so boundary analysis was skipped',
       )
       return blank(loaded, bad, notes)
     }

@@ -94,3 +94,9 @@ failure:
   reproduce:
     status: 500
     exception: Cannot read properties of null
+
+# What "eliminated" means for this bug. `repro verify` checks it and reports
+# PASS or FAIL; without it, verify reports the rate change and nothing more.
+verify:
+  trials: 10
+  reproduced: { max: 0 }
