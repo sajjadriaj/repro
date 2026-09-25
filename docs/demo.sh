@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Regenerates docs/demo.gif and docs/demo.cast.
+# Regenerates docs/assets/demo.gif and docs/assets/demo.cast.
 #
 # Everything in the recording is really executed against example/ — nothing is
 # staged or faked. A tool about reproducibility should have a reproducible demo.
@@ -87,11 +87,11 @@ SESSION
 asciinema rec \
   --cols 92 --rows 34 --overwrite --idle-time-limit 2 \
   --command "bash $WORK/session.sh" \
-  "$ROOT/docs/demo.cast"
+  "$ROOT/docs/assets/demo.cast"
 
 agg --quiet \
   --theme github-dark --font-size 15 --line-height 1.35 \
   --speed 1.4 --idle-time-limit 1 --last-frame-duration 4 --fps-cap 20 \
-  "$ROOT/docs/demo.cast" "$ROOT/docs/demo.gif"
+  "$ROOT/docs/assets/demo.cast" "$ROOT/docs/assets/demo.gif"
 
-echo "wrote docs/demo.cast and docs/demo.gif"
+echo "wrote docs/assets/demo.cast and docs/assets/demo.gif"

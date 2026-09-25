@@ -639,7 +639,7 @@ ${bold('USAGE')}
 
 ${bold('COMMANDS')}
   init <description>     Inspect the repo and scaffold .repro/repro.yaml
-  from <file>            Same, seeded from evidence (.md .log .har .curl .txt)
+  from <file>            Same, seeded from evidence (.md .log .har .curl .txt .jsonl)
   run                    Execute the reproduction and report a verdict
   establish              Measure the failure repeatedly and record a baseline
   seal                   Freeze the contract, baseline and environment
