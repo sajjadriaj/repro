@@ -1,6 +1,7 @@
 /** Human-readable rendering. Agent-readable output goes through --json. */
 import path from 'node:path'
-import type { RepeatResult } from './run.js'
+import type { CoverageItem, RepeatResult } from './run.js'
+import type { FileChanges } from './evidence.js'
 import type { Baseline, Seal, StatusReport, VerifyReport } from './seal.js'
 import type { MinimizeResult } from './minimize.js'
 import type { ExplainReport } from './explain.js'
@@ -83,7 +84,33 @@ export function renderRun(result: RepeatResult, cwd = process.cwd()): string {
     const dir = path.relative(cwd, path.dirname(result.artifacts[0]!)) || '.'
     lines.push(field('Evidence:', `${dir}${path.sep}`))
   }
+  if (result.coverage?.length) lines.push(field('Coverage:', renderCoverage(result.coverage)))
   return lines.join('\n')
+}
+
+/**
+ * One line per layer. A mark says how far the evidence goes; the detail says
+ * why, so "uncontrolled" reads as a fact about the setup and not a verdict.
+ */
+export function renderCoverage(items: CoverageItem[]): string {
+  const mark: Record<CoverageItem['status'], string> = {
+    captured: green('✓'),
+    partial: yellow('~'),
+    uncontrolled: red('!'),
+    none: dim('-'),
+  }
+  const width = Math.max(...items.map((i) => i.layer.length))
+  return items.map((i) => `${mark[i.status]} ${i.layer.padEnd(width)}  ${dim(i.detail)}`).join('\n')
+}
+
+function renderFiles(files: FileChanges | undefined): string {
+  if (!files) return dim('(not observed)')
+  const parts = [
+    ...files.added.map((f) => `+ ${f}`),
+    ...files.modified.map((f) => `~ ${f}`),
+    ...files.deleted.map((f) => `- ${f}`),
+  ]
+  return parts.length ? parts.join('\n') : dim('(no files changed)')
 }
 
 function classificationColor(result: RepeatResult): string {
@@ -183,10 +210,29 @@ export function renderExplain(report: ExplainReport): string {
   if (report.relevant_code_paths.length) {
     lines.push(field('Relevant code paths:', report.relevant_code_paths.join('\n')))
   }
+  if (report.trajectory) {
+    const t = report.trajectory
+    lines.push(
+      field(
+        'Trajectory divergence:',
+        t.divergence
+          ? [
+              `at event ${t.divergence.index + 1}`,
+              `  reproduced:      ${red(t.divergence.reproduced ?? '(trajectory ended)')}`,
+              `  not reproduced:  ${green(t.divergence.not_reproduced ?? '(trajectory ended)')}`,
+            ].join('\n')
+          : 'the two trajectories are identical — the difference is in tool results or output, not in the path',
+      ),
+    )
+    lines.push(field('Files changed (reproduced):', renderFiles(t.files.reproduced)))
+    lines.push(field('Files changed (not reproduced):', renderFiles(t.files.not_reproduced)))
+  }
   if (report.exception) lines.push(field('Exception:', report.exception))
   if (report.log_tail.length) {
     lines.push(field('Log tail:', dim(report.log_tail.slice(-10).join('\n'))))
   }
+  // Notes on a reproduced run say what could not be analysed and why.
+  if (report.status === 'reproduced') for (const note of report.notes) lines.push(field('Note:', note))
   lines.push(
     '',
     dim('repro reports where behaviour diverges. Diagnosing why is the agent’s job.'),
@@ -293,6 +339,17 @@ export function renderVerify(report: VerifyReport): string {
   if (report.fixtures === 'MODIFIED') lines.push(field('Fixtures:', red('MODIFIED')))
   if (report.environment_drift.length) {
     lines.push(field('Environment drift:', dim(report.environment_drift.join('\n'))))
+  }
+  if (report.trajectory) {
+    const d = report.trajectory.divergence
+    lines.push(
+      field(
+        'Trajectory:',
+        d
+          ? `diverges from the sealed bug path at event ${d.index + 1}\n  sealed:   ${red(d.sealed ?? '(trajectory ended)')}\n  current:  ${green(d.current ?? '(trajectory ended)')}`
+          : 'same path as the sealed bug',
+      ),
+    )
   }
   if (report.policy) {
     lines.push(

@@ -13,12 +13,13 @@ import path from 'node:path'
 import {
   failureStepIndex,
   matchOutcome,
+  stepKindOf,
   stepLabel,
   type LoadedSpec,
   type Observed,
   type Spec,
 } from './spec.js'
-import { newRunDir, type NetworkEntry, type RunDir } from './evidence.js'
+import { changedFiles, fingerprint, git, newRunDir, type Fingerprint, type NetworkEntry, type RunDir } from './evidence.js'
 import {
   assertReachable,
   closeBrowser,
@@ -27,6 +28,8 @@ import {
   type ExecContext,
   type ServiceHandle,
 } from './exec.js'
+import { compactEvents, describeEvent, type EventKey } from './agent.js'
+import { VERSION } from './version.js'
 
 /**
  * Four outcomes, never three. INVALID (a precondition never held, so the
@@ -57,8 +60,21 @@ export type FailureReport = {
     /** Agent steps: what the agent actually did, in order. */
     trajectory?: string
   }
+  /** Agent steps: the whole trajectory, compact enough to seal and to diff. */
+  events?: EventKey[]
   /** Why the reproduce matcher did not match (empty when it did). */
   mismatch: string[]
+}
+
+/**
+ * One line of the coverage report: which layer of the execution this run
+ * recorded, and how well. Evidence about the evidence — never a score,
+ * because "87% reproducible" would have to invent the weights.
+ */
+export type CoverageItem = {
+  layer: string
+  status: 'captured' | 'partial' | 'uncontrolled' | 'none'
+  detail: string
 }
 
 export type RunResult = {
@@ -74,10 +90,15 @@ export type RunResult = {
   network: NetworkEntry[]
   /** Tail of the service/browser logs produced during this run. */
   log_excerpt: string
+  /** Where this run happened. Recorded per run so two runs can be compared. */
+  environment?: Fingerprint
+  coverage?: CoverageItem[]
 }
 
 export type RunOptions = {
   repeat?: number
+  /** Recorded in each run's fingerprint. */
+  version?: string
   /**
    * The application is already running here; do not start `services:`.
    *
@@ -116,6 +137,8 @@ export type RepeatResult = {
   failure?: FailureReport
   error?: string
   artifacts: string[]
+  environment?: Fingerprint
+  coverage?: CoverageItem[]
   runs_detail: { id: string; status: RunStatus; duration_ms: number }[]
 }
 
@@ -157,7 +180,25 @@ export async function executeOnce(
 ): Promise<RunResult> {
   const { spec, root, reproDir } = loaded
   const started = Date.now()
-  const run = opts.evidence === false ? await scratchRunDir(reproDir) : await newRunDir(reproDir)
+  const evidence = opts.evidence !== false
+  const run = evidence ? await newRunDir(reproDir) : await scratchRunDir(reproDir)
+
+  // The code under test, before any step touches it: commit, lockfiles, and
+  // the uncommitted diff. "Reproduced against SHA X with these changes" is
+  // only answerable if this was written down at the start.
+  let environment: Fingerprint | undefined
+  let gitTop: string | undefined
+  const repoFiles: string[] = []
+  if (evidence) {
+    environment = await fingerprint(root, opts.version ?? VERSION)
+    gitTop = (await git(root, ['rev-parse', '--show-toplevel']))?.trim() || undefined
+    if (environment.git_dirty) {
+      const patch = await git(root, ['diff', 'HEAD', '--', '.'])
+      if (patch) repoFiles.push(await run.write('repo.patch', patch))
+      const status = await git(root, ['status', '--porcelain', '--untracked-files=all', '--', '.'])
+      if (status) repoFiles.push(await run.write('repo.status', status))
+    }
+  }
 
   const network: NetworkEntry[] = []
   const extraLogs: string[] = []
@@ -180,6 +221,7 @@ export async function executeOnce(
     trace: opts.trace === true,
     headed: opts.headed === true,
     onLog: (line) => extraLogs.push(`${line}\n`),
+    gitTop,
   }
 
   const steps: Observed[] = []
@@ -284,7 +326,9 @@ export async function executeOnce(
     artifacts: [],
     network,
     log_excerpt: logs.slice(-8000),
+    environment,
   }
+  if (evidence) result.coverage = coverage(spec, result, opts, Boolean(gitTop))
 
   if (holder?.handle) {
     await writeFile(run.file('service.log'), holder.handle.logs().slice(logMark)).catch(() => {})
@@ -294,6 +338,7 @@ export async function executeOnce(
   result.artifacts = [
     run.file('result.json'),
     ...(network.length ? [run.file('network.json')] : []),
+    ...repoFiles,
     ...steps.flatMap((s) => s.screenshots ?? []),
     ...steps.flatMap((s) => s.artifacts ?? []),
   ]
@@ -355,6 +400,7 @@ function evaluate(
       body_excerpt: excerpt(observed.body),
       trajectory: trajectory(observed),
     },
+    events: observed.trace?.events.length ? compactEvents(observed.trace.events) : undefined,
     mismatch: match.reasons,
   }
   return { status: match.ok ? 'reproduced' : 'not_reproduced', failure: report }
@@ -364,9 +410,80 @@ function evaluate(
 function trajectory(observed: Observed): string | undefined {
   const events = observed.trace?.events
   if (!events?.length) return undefined
-  const shown = events.slice(0, 12).map((e) => (e.name ? `${e.type} ${e.name}` : e.type))
+  const shown = events.slice(0, 12).map(describeEvent)
   if (events.length > shown.length) shown.push(`… ${events.length - shown.length} more`)
   return shown.join(' → ')
+}
+
+// ---------------------------------------------------------------- coverage
+
+/**
+ * Which layers of this execution the run recorded, which it could only see
+ * in part, and which it does not control. Derived from what the run
+ * actually produced, so a layer is "captured" because the file is there,
+ * not because the feature exists.
+ */
+export function coverage(spec: Spec, result: RunResult, opts: RunOptions, inRepo: boolean): CoverageItem[] {
+  const items: CoverageItem[] = []
+  const add = (layer: string, status: CoverageItem['status'], detail: string) => items.push({ layer, status, detail })
+  const kinds = new Set([...(spec.setup ?? []), ...spec.scenario, ...(spec.teardown ?? [])].map(stepKindOf))
+  const runsProcesses = kinds.has('shell') || kinds.has('agent')
+  const env = result.environment
+  const n = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`
+
+  if (env?.git_commit) {
+    add('repository state', 'captured', `git ${env.git_commit}${env.git_dirty ? ', uncommitted changes in repo.patch' : ''}`)
+  } else add('repository state', 'uncontrolled', 'not a git repository')
+
+  if (runsProcesses) {
+    const observed = result.steps.filter((s) => s.files)
+    if (!inRepo) add('filesystem mutations', 'none', 'not observed — the project root is not a git repository')
+    else {
+      const files = new Set(observed.flatMap((s) => changedFiles(s.files!)))
+      add(
+        'filesystem mutations',
+        'captured',
+        files.size ? `${n(files.size, 'file')} changed across ${n(observed.filter((s) => changedFiles(s.files!).length).length, 'step')}` : 'no files changed',
+      )
+    }
+    add('subprocesses', 'partial', 'exit codes and output captured; process trees are not observed')
+  }
+
+  const agentSteps = spec.scenario.map((s, i) => [s, i] as const).filter(([s]) => s.agent)
+  if (agentSteps.length) {
+    const replayed = agentSteps.map(([s]) => s.agent!.replay).filter(Boolean)
+    const events = result.steps.flatMap((s) => s.trace?.events ?? [])
+    const models = events.filter((e) => e.type === 'model')
+    const answered = models.filter((e) => e.output !== undefined)
+    if (replayed.length) {
+      add('model responses', 'captured', `replayed from ${replayed.join(', ')} — the agent honours REPRO_REPLAY, repro only sets it`)
+    }
+    else if (answered.length) add('model responses', 'captured', `${n(answered.length, 'model response')} recorded in traces/`)
+    else if (models.length) add('model responses', 'partial', `${n(models.length, 'model event')} recorded without responses`)
+    else add('model responses', 'none', 'the agent emitted no model events')
+    const mcp = events.filter((e) => e.server)
+    if (mcp.length) add('MCP', 'partial', `${n(mcp.length, 'MCP call')} recorded; servers are not managed by repro`)
+  }
+
+  if (kinds.has('http') || kinds.has('browser') || result.network.length) {
+    add('HTTP responses', 'captured', `${n(result.network.length, 'exchange')} repro drove, in network.json`)
+  }
+  if (runsProcesses || spec.services?.length) {
+    add('outbound network', 'uncontrolled', 'calls the application or agent makes are not recorded')
+  }
+
+  add('environment', 'captured', 'os, runtime and lockfiles fingerprinted; environment variables never recorded')
+  add('randomness', 'partial', 'time and randomness are not controlled; --repeat measures the rate')
+
+  if (kinds.has('http') || kinds.has('browser')) {
+    const url = opts.baseUrl ?? spec.base_url
+    if (opts.baseUrl || !spec.services?.length) {
+      add('application', 'uncontrolled', url ? `${url} is not managed by repro` : 'no services declared')
+    } else {
+      add('application', 'captured', `started by repro: ${spec.services.map((s) => s.name ?? s.command).join(', ')}`)
+    }
+  }
+  return items
 }
 
 function excerpt(body: string | undefined, max = 400): string | undefined {
@@ -414,6 +531,8 @@ export function aggregate(spec: Spec, results: RunResult[], fatal?: string): Rep
     failure: anyFailure?.failure,
     error: fatal ?? results.find((r) => r.error)?.error,
     artifacts: (reproduced ?? results.at(-1))?.artifacts ?? [],
+    environment: (reproduced ?? results.at(-1))?.environment,
+    coverage: (reproduced ?? results.at(-1))?.coverage,
     runs_detail: results.map((r) => ({ id: r.run_id, status: r.status, duration_ms: r.duration_ms })),
   }
 }

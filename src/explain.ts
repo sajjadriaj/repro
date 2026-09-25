@@ -11,7 +11,8 @@ import path from 'node:path'
 import { jsonPath, stepKindOf, stepLabel, type LoadedSpec, type Observed } from './spec.js'
 import type { RunResult } from './run.js'
 import { makeProber, type Prober } from './minimize.js'
-import type { NetworkEntry } from './evidence.js'
+import type { FileChanges, NetworkEntry } from './evidence.js'
+import { compactEvents, describeEvent, firstDivergence } from './agent.js'
 
 export type NecessaryStep = {
   index: number
@@ -45,8 +46,23 @@ export type ExplainReport = {
   relevant_code_paths: string[]
   log_tail: string[]
   exception?: string
+  /** Agent failure steps: the bug path against a run that did not take it. */
+  trajectory?: TrajectoryDivergence
   notes: string[]
   run_dir: string
+}
+
+/**
+ * Two trajectories of the same agent step, one that reproduced and one that
+ * did not, with the first event where they part and what each run did to
+ * the working tree. The semantic decision and its physical consequence, side
+ * by side, instead of two hundred changed events.
+ */
+export type TrajectoryDivergence = {
+  reproduced: string[]
+  not_reproduced: string[]
+  divergence?: { index: number; reproduced?: string; not_reproduced?: string }
+  files: { reproduced?: FileChanges; not_reproduced?: FileChanges }
 }
 
 export type ExplainOptions = {
@@ -106,8 +122,43 @@ export async function explain(
     // floor from two identical runs so it can be subtracted from every diff —
     // otherwise a fresh session id looks exactly like a causal state change.
     opts.onProgress?.('measuring run-to-run noise')
-    const bad2 = await prober.testOnce(prober.all)
+    // An agent failure diverges inside one step, not between steps, so this
+    // second run keeps evidence: if it is the clean run, its file changes
+    // must have been observed like the bad run's were.
+    const agentFailure = stepKindOf(spec.scenario[prober.failureIndex]) === 'agent'
+    const bad2 = await prober.testOnce(prober.all, { evidence: agentFailure })
     const noise = noisePaths(bad.network, bad2.network)
+
+    // Find a run that did not take the bug path and say where the two part ways.
+    let trajectory: TrajectoryDivergence | undefined
+    if (agentFailure) {
+      // ponytail: three extra runs, then give up. A deterministic agent bug
+      // never yields a clean run and every attempt may cost real model calls.
+      let good = bad2.status === 'not_reproduced' ? bad2 : undefined
+      for (let attempt = 0; attempt < 3 && !good; attempt++) {
+        opts.onProgress?.(`looking for a run that does not take the bug path (attempt ${attempt + 1} of 3)`)
+        const candidate = await prober.testOnce(prober.all, { evidence: true })
+        if (candidate.status === 'not_reproduced') good = candidate
+      }
+      const at = (run: RunResult) => run.steps[prober.failureIndex]
+      if (good) {
+        const left = compactEvents(at(bad)?.trace?.events ?? [])
+        const right = compactEvents(at(good)?.trace?.events ?? [])
+        const d = firstDivergence(left, right)
+        trajectory = {
+          reproduced: left.map(describeEvent),
+          not_reproduced: right.map(describeEvent),
+          divergence: d && {
+            index: d.index,
+            reproduced: d.left && describeEvent(d.left),
+            not_reproduced: d.right && describeEvent(d.right),
+          },
+          files: { reproduced: at(bad)?.files, not_reproduced: at(good)?.files },
+        }
+      } else {
+        notes.push('every attempt took the bug path, so there is no trajectory to diverge from')
+      }
+    }
 
     const stateDiff: StateDiff[] = []
     if (boundaryStep) {
@@ -154,6 +205,7 @@ export async function explain(
       relevant_code_paths: codePaths(loaded.root, bad),
       log_tail: tail(bad.log_excerpt),
       exception: bad.failure?.observed.exception,
+      trajectory,
       notes,
       run_dir: bad.run_dir,
     }

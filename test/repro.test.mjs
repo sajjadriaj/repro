@@ -38,6 +38,11 @@ import {
   validateJsonSchema,
   validateSpec,
   wilson,
+  coverage,
+  diffSnapshots,
+  firstDivergence,
+  fromTrace,
+  trajectoryDrift,
 } from '../dist/index.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -825,3 +830,366 @@ function cliOutput(args) {
     maxBuffer: 64 * 1024 * 1024,
   })
 }
+
+// ------------------------------------------------ agent-aware events (phase 1)
+
+test('parseTrace accepts the spellings other emitters use for the same events', () => {
+  const trace = parseTrace(
+    [
+      '{"type":"agent.step","step":1}',
+      '{"type":"model.request","name":"planner","input":"refund 123","model":"claude-sonnet-5"}',
+      '{"type":"model.response","output":{"skip_lookup":true}}',
+      '{"type":"mcp_call","tool":"read_file","server":"filesystem","arguments":{"path":"orders.json"}}',
+      '{"type":"mcp_result","name":"read_file","server":"filesystem","result":"{}"}',
+      '{"type":"agent_step"}',
+      '{"type":"tool_use","name":"Bash","input":{"command":"npm test"}}',
+    ].join('\n'),
+  )
+  assert.deepEqual(
+    trace.events.map((e) => [e.type, e.name, e.server, e.step]),
+    [
+      ['model', 'planner', undefined, 1],
+      ['tool_call', 'read_file', 'filesystem', 1],
+      ['tool_result', 'read_file', 'filesystem', 1],
+      ['tool_call', 'Bash', undefined, 2],
+    ],
+  )
+  // A response completes the request before it; there is one model event, not two.
+  assert.equal(trace.events[0].model, 'claude-sonnet-5')
+  assert.deepEqual(trace.events[0].output, { skip_lookup: true })
+  // An MCP call without a named server is still marked as one.
+  assert.equal(parseTrace('{"type":"mcp_call","name":"x"}').events[0].server, 'mcp')
+})
+
+test('a trace matches on which MCP server a tool came from', () => {
+  const trace = parseTrace(
+    [
+      '{"type":"mcp_call","name":"read_file","server":"filesystem","input":{}}',
+      '{"type":"tool_call","name":"read_file","input":{}}',
+    ].join('\n'),
+  )
+  const o = agentObserved(trace)
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'read_file', server: 'filesystem' } } }, o).ok, true)
+  const wrong = matchOutcome({ trace: { tool_call: { name: 'read_file', server: 'github' } } }, o)
+  assert.equal(wrong.ok, false)
+  assert.match(wrong.reasons[0], /no tool_call "read_file" @github/)
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'read_file', count: 2 } } }, o).ok, true)
+})
+
+test('diffSnapshots reads a step\'s effect on the working tree', () => {
+  const before = { 'src/a.ts': ' M:h1', 'scratch.txt': '??:h2', 'gone.ts': ' M:h3', 'old.txt': '??:h4' }
+  const after = { 'src/a.ts': ' M:h9', 'scratch.txt': '??:h2', 'new.txt': '??:h5', 'gone.ts': 'D', 'src/b.ts': ' M:h6' }
+  assert.deepEqual(diffSnapshots(before, after), {
+    added: ['new.txt'],
+    // a.ts edited, b.ts newly dirty, old.txt (untracked) removed → deleted below
+    modified: ['src/a.ts', 'src/b.ts'],
+    deleted: ['gone.ts', 'old.txt'],
+  })
+  assert.deepEqual(diffSnapshots(before, before), { added: [], modified: [], deleted: [] })
+})
+
+test('files_changed matches paths a step touched, and says when nothing was observed', () => {
+  const touched = { kind: 'shell', label: 'x', exit_code: 0, duration_ms: 1, files: { added: [], modified: ['src/auth.ts'], deleted: [] } }
+  assert.equal(matchOutcome({ files_changed: 'auth.ts' }, touched).ok, true)
+  assert.match(matchOutcome({ files_changed: ['auth.ts', 'middleware.ts'] }, touched).reasons[0], /middleware\.ts/)
+  const blind = { kind: 'http', label: 'x', status: 200, duration_ms: 1 }
+  assert.match(matchOutcome({ files_changed: 'auth.ts' }, blind).reasons[0], /not observed/)
+})
+
+test('a shell step\'s file changes are observed in a git repository', { timeout: 60_000 }, () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-files-'))
+  try {
+    const sh = (args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, stdio: 'pipe' })
+    sh(['init', '-q'])
+    // Ignore the whole .repro/ so the spec itself does not count as an uncommitted change.
+    writeFileSync(path.join(dir, '.gitignore'), '.repro/\n')
+    writeFileSync(path.join(dir, 'auth.ts'), 'export const a = 1\n')
+    sh(['add', '.'])
+    sh(['commit', '-q', '-m', 'init'])
+    mkdirSync(path.join(dir, '.repro'), { recursive: true })
+    writeFileSync(
+      path.join(dir, '.repro', 'repro.yaml'),
+      [
+        'name: agent-edits-auth',
+        'scenario:',
+        '  - id: edit',
+        '    shell: echo "export const a = 2" > auth.ts && echo new > notes.txt',
+        'failure:',
+        '  step: edit',
+        '  reproduce:',
+        '    files_changed: [auth.ts, notes.txt]',
+        '',
+      ].join('\n'),
+    )
+    const out = JSON.parse(execFileSync(process.execPath, [cli, 'run', '--json', '--quiet'], { cwd: dir, encoding: 'utf8' }))
+    assert.equal(out.status, 'reproduced')
+    assert.match(out.environment.git_commit, /^[0-9a-f]{7}$/)
+    assert.equal(out.environment.git_dirty, false, 'the tree was clean when the run started')
+    const result = JSON.parse(readFileSync(out.artifacts[0], 'utf8'))
+    assert.deepEqual(result.steps[0].files, { added: ['notes.txt'], modified: ['auth.ts'], deleted: [] })
+    const fs = out.coverage.find((c) => c.layer === 'filesystem mutations')
+    assert.equal(fs.status, 'captured')
+    assert.match(fs.detail, /2 files changed across 1 step/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// --------------------------------------------------------- coverage (phase 2)
+
+test('coverage reports what the run recorded, never a score', () => {
+  const spec = {
+    name: 'x',
+    scenario: [{ id: 'a', agent: { run: 'node agent.mjs' } }],
+    failure: { reproduce: { trace: { tool_call: { name: 'x' } } } },
+  }
+  const run = (steps, environment) => ({
+    status: 'reproduced', run_id: '1', run_dir: '', duration_ms: 1, steps, artifacts: [], network: [], log_excerpt: '', environment,
+  })
+  const model = { type: 'model', name: 'planner', output: 'decided' }
+  const withModel = coverage(spec, run([{ kind: 'agent', label: 'a', duration_ms: 1, trace: { events: [model] } }], { git_commit: 'abc1234', locks: {} }), {}, true)
+  const layer = (items, name) => items.find((i) => i.layer === name)
+  assert.equal(layer(withModel, 'repository state').status, 'captured')
+  assert.equal(layer(withModel, 'model responses').status, 'captured')
+  assert.equal(layer(withModel, 'subprocesses').status, 'partial')
+  assert.equal(layer(withModel, 'outbound network').status, 'uncontrolled')
+  assert.equal(layer(withModel, 'HTTP responses'), undefined, 'no http steps, no claim')
+
+  const noRepo = coverage(spec, run([{ kind: 'agent', label: 'a', duration_ms: 1, trace: { events: [] } }], { locks: {} }), {}, false)
+  assert.equal(layer(noRepo, 'repository state').status, 'uncontrolled')
+  assert.equal(layer(noRepo, 'filesystem mutations').status, 'none')
+  assert.equal(layer(noRepo, 'model responses').status, 'none')
+
+  const replayed = coverage({ ...spec, scenario: [{ id: 'a', agent: { run: 'x', replay: 'fixtures/t.jsonl' } }] }, run([], { locks: {} }), {}, true)
+  assert.match(layer(replayed, 'model responses').detail, /replayed from fixtures\/t\.jsonl/)
+
+  const http = coverage(
+    { name: 'x', base_url: 'http://staging', scenario: [{ http: { url: '/a' } }], failure: { reproduce: { status: 500 } } },
+    run([], { locks: {} }),
+    {},
+    false,
+  )
+  assert.equal(layer(http, 'application').status, 'uncontrolled')
+  assert.match(layer(http, 'application').detail, /staging/)
+  assert.ok(!('score' in withModel[0]))
+})
+
+// ------------------------------------------------------- divergence (phase 3)
+
+test('firstDivergence finds the earliest decision that differed', () => {
+  const bug = [{ type: 'model', name: 'planner' }, { type: 'tool_call', name: 'refund_order' }, { type: 'tool_result', name: 'refund_order' }]
+  const fixed = [{ type: 'model', name: 'planner' }, { type: 'tool_call', name: 'get_order' }, { type: 'tool_result', name: 'get_order' }]
+  assert.deepEqual(firstDivergence(bug, fixed), { index: 1, left: bug[1], right: fixed[1] })
+  assert.equal(firstDivergence(bug, bug), undefined)
+  // A trajectory that stops early diverges where it stopped.
+  assert.deepEqual(firstDivergence(bug, bug.slice(0, 2)), { index: 2, left: bug[2], right: undefined })
+  // The same tool from a different MCP server is a different decision.
+  assert.equal(firstDivergence([{ type: 'tool_call', name: 'read', server: 'a' }], [{ type: 'tool_call', name: 'read', server: 'b' }]).index, 0)
+  const drift = trajectoryDrift(bug, fixed)
+  assert.deepEqual(drift.divergence, { index: 1, sealed: 'tool_call refund_order', current: 'tool_call get_order' })
+  assert.equal(trajectoryDrift(undefined, fixed), undefined)
+})
+
+test('verify says where the fixed agent left the sealed bug path', { timeout: 120_000 }, () => {
+  // The rate comes from the environment, so the contract hash is identical
+  // while the agent is broken and after it is "fixed".
+  const dir = path.join(os.tmpdir(), `repro-trajectory-${process.pid}`, '.repro')
+  mkdirSync(dir, { recursive: true })
+  const spec = path.join(dir, 'repro.yaml')
+  writeFileSync(
+    spec,
+    readFileSync(path.join(exampleRoot, '.repro', 'agent.yaml'), 'utf8').replace('AGENT_BUG_RATE: "1"', 'AGENT_BUG_RATE: "${env.BUG_RATE}"'),
+  )
+  const at = (rate, ...args) => {
+    try {
+      return execFileSync(process.execPath, [cli, ...args, '--spec', spec, '--root', exampleRoot, '--quiet', '--json'], {
+        cwd: exampleRoot,
+        encoding: 'utf8',
+        env: { ...process.env, BUG_RATE: rate },
+      })
+    } catch (err) {
+      if (err.stdout) return err.stdout
+      throw err
+    }
+  }
+  try {
+    const baseline = JSON.parse(at('1', 'establish', '--repeat', '2'))
+    assert.deepEqual(baseline.trajectory.map((e) => e.name), ['planner', 'refund_order', 'refund_order', 'assistant'])
+    JSON.parse(at('1', 'seal'))
+    const verified = JSON.parse(at('0', 'verify', '--repeat', '1'))
+    assert.equal(verified.contract, 'UNCHANGED')
+    assert.equal(verified.current.reproduced, 0)
+    assert.deepEqual(verified.trajectory.divergence, { index: 1, sealed: 'tool_call refund_order', current: 'tool_call get_order' })
+  } finally {
+    rmSync(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('explain says so when no run avoids the bug path', { timeout: 120_000 }, () => {
+  const why = JSON.parse(cliOutput(['explain', '--json', '--spec', '.repro/agent.yaml']))
+  assert.equal(why.status, 'reproduced')
+  assert.equal(why.trajectory, undefined)
+  assert.ok(why.notes.some((n) => /every attempt took the bug path/.test(n)))
+})
+
+// ---------------------------------------------------- trace importer (phase 4)
+
+test('fromTrace turns a recorded trajectory into an agent reproduction', () => {
+  const trace = parseTrace(TRACE_LINES)
+  const imported = fromTrace(trace, '/tmp/support.jsonl', 'support.jsonl')
+  assert.equal(imported.scenario.length, 1)
+  assert.equal(imported.scenario[0].agent.trace_file, '<trace>')
+  assert.deepEqual(imported.reproduce, {
+    trace: { tool_call: { name: 'refund_order', arguments: { order_id: { contains: '123' } } } },
+  })
+  assert.equal(imported.traceFile, '/tmp/support.jsonl')
+  assert.match(imported.description, /3 events, 1 tool calls/)
+  // No `expect: { status: 200 }` on an agent bug.
+  const spec = draftSpec({ description: 'x', facts: { packageManager: 'npm', scripts: {}, setupCommands: [], destructiveSetupCommands: [], notes: [] }, scenario: imported.scenario, reproduce: imported.reproduce })
+  assert.equal(spec.failure.expect, undefined)
+})
+
+test('repro from <trace.jsonl> reproduces from the recording', { timeout: 60_000 }, () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-from-trace-'))
+  try {
+    writeFileSync(path.join(dir, 'package.json'), '{"name":"x","private":true}')
+    const evidence = path.join(dir, 'incident.jsonl')
+    writeFileSync(evidence, TRACE_LINES)
+    const init = JSON.parse(execFileSync(process.execPath, [cli, 'from', evidence, '--json'], { cwd: dir, encoding: 'utf8' }))
+    assert.ok(init.notes.some((n) => /derived from the last tool call/.test(n)))
+    const yaml = readFileSync(init.spec, 'utf8')
+    assert.match(yaml, /trace_file: \.repro\/fixtures\/incident\.jsonl/)
+    assert.ok(existsSync(path.join(dir, '.repro', 'fixtures', 'incident.jsonl')))
+    assert.match(readFileSync(init.brief, 'utf8'), /The trace was imported/)
+
+    const run = JSON.parse(execFileSync(process.execPath, [cli, 'run', '--json', '--quiet'], { cwd: dir, encoding: 'utf8' }))
+    assert.equal(run.status, 'reproduced')
+    assert.match(run.failure.trajectory, /tool_call refund_order/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// -------------------------------------------- replay contract / worktree (phase 5)
+
+test('a replayed decision reproduces the bug with the tools live', { timeout: 60_000 }, () => {
+  const dir = path.join(os.tmpdir(), `repro-replay-${process.pid}`, '.repro')
+  mkdirSync(dir, { recursive: true })
+  const recording = path.join(dir, 'decision.jsonl')
+  writeFileSync(recording, '{"type":"model","name":"planner","output":{"skip_lookup":true}}\n')
+  const spec = path.join(dir, 'repro.yaml')
+  writeFileSync(
+    spec,
+    readFileSync(path.join(exampleRoot, '.repro', 'agent.yaml'), 'utf8')
+      .replace('AGENT_BUG_RATE: "1"', 'AGENT_BUG_RATE: "0"')
+      .replace('timeout_ms: 30000', `timeout_ms: 30000\n      replay: ${recording}\n      record: true`),
+  )
+  try {
+    // The agent would never take the bug path on its own now; the recorded decision makes it.
+    const run = JSON.parse(cliOutput(['run', '--json', '--spec', spec, '--root', exampleRoot]))
+    assert.equal(run.status, 'reproduced')
+    assert.match(run.coverage.find((c) => c.layer === 'model responses').detail, /replayed from/)
+    const recorded = path.join(path.dirname(run.artifacts[0]), 'recordings', 'decision.jsonl')
+    assert.ok(existsSync(recorded), 'the agent saved its decision under REPRO_RECORD')
+    assert.ok(run.artifacts.includes(recorded), 'the recording is listed as evidence')
+    assert.match(readFileSync(recorded, 'utf8'), /"skip_lookup":true/)
+  } finally {
+    rmSync(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('--worktree runs the contract against another commit', { timeout: 120_000 }, () => {
+  const run = JSON.parse(cliOutput(['run', '--json', '--quiet', '--worktree', 'HEAD']))
+  assert.equal(run.status, 'reproduced')
+  assert.equal(run.environment.git_dirty, false, 'a fresh worktree is clean')
+  assert.ok(run.artifacts[0].startsWith(path.join(exampleRoot, '.repro')), 'evidence stays with the spec, not the worktree')
+})
+
+test('--worktree lends today\'s .repro/ to a ref that predates it', { timeout: 120_000 }, () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'repro-worktree-'))
+  try {
+    const sh = (args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, stdio: 'pipe' })
+    sh(['init', '-q'])
+    writeFileSync(path.join(dir, '.gitignore'), '.repro/\n')
+    sh(['add', '.'])
+    sh(['commit', '-q', '-m', 'before the reproduction existed'])
+    // The spec and its fixture are uncommitted: HEAD has no .repro/ at all.
+    mkdirSync(path.join(dir, '.repro', 'fixtures'), { recursive: true })
+    writeFileSync(path.join(dir, '.repro', 'fixtures', 't.jsonl'), '{"type":"tool_call","name":"refund_order","input":{}}\n')
+    writeFileSync(
+      path.join(dir, '.repro', 'repro.yaml'),
+      [
+        'name: from-recording',
+        'scenario:',
+        '  - id: agent',
+        '    agent:',
+        '      trace_file: .repro/fixtures/t.jsonl',
+        'failure:',
+        '  step: agent',
+        '  reproduce:',
+        '    trace:',
+        '      tool_call: { name: refund_order }',
+        '',
+      ].join('\n'),
+    )
+    const out = JSON.parse(
+      execFileSync(process.execPath, [cli, 'run', '--json', '--quiet', '--worktree', 'HEAD'], { cwd: dir, encoding: 'utf8' }),
+    )
+    assert.equal(out.status, 'reproduced', out.error)
+    assert.equal(out.environment.git_dirty, false, 'the lent .repro/ does not read as a change')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// --------------------------------------------------- claude code stream (phase 6)
+
+const CLAUDE_STREAM = [
+  '{"type":"system","subtype":"init","model":"claude-sonnet-5"}',
+  '{"type":"user","message":{"role":"user","content":"fix the auth bug"}}',
+  '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Editing."},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/auth.ts"}}],"usage":{"input_tokens":100,"output_tokens":20}}}',
+  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}',
+  '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"tool_use","id":"t2","name":"mcp__github__create_pr","input":{"title":"fix"}}],"usage":{"input_tokens":150,"output_tokens":10}}}',
+  '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"#42"}]}}',
+  '{"type":"result","subtype":"success","result":"Opened #42","duration_ms":1234,"usage":{"input_tokens":250,"output_tokens":30}}',
+].join('\n')
+
+test('a Claude Code stream is recognized and normalized', () => {
+  const trace = parseTrace(CLAUDE_STREAM)
+  assert.equal(trace.input, 'fix the auth bug')
+  assert.deepEqual(
+    trace.events.map((e) => [e.type, e.name, e.server, e.step]),
+    [
+      ['model', 'claude-sonnet-5', undefined, 1],
+      // Blocks keep their order: the text came before the tool use.
+      ['message', 'assistant', undefined, 1],
+      ['tool_call', 'Edit', undefined, 1],
+      ['tool_result', 'Edit', undefined, 1],
+      ['model', 'claude-sonnet-5', undefined, 2],
+      ['tool_call', 'create_pr', 'github', 2],
+      ['tool_result', 'create_pr', 'github', 2],
+    ],
+  )
+  assert.equal(trace.output, 'Opened #42')
+  assert.equal(trace.duration_ms, 1234)
+  assert.equal(trace.usage.total_tokens, 280)
+  const o = agentObserved(trace)
+  assert.equal(matchOutcome({ trace: { tool_call: { name: 'create_pr', server: 'github' } } }, o).ok, true)
+  assert.equal(matchOutcome({ trace: { sequence: { contains: [{ tool: 'create_pr' }], not_preceded_by: { tool: 'Bash' } } } }, o).ok, true)
+  // Forced format wins over detection; generic JSONL through the claude path yields nothing.
+  assert.equal(parseTrace(TRACE_LINES, 'claude-code').events.length, 0)
+  assert.equal(parseTrace(TRACE_LINES, 'jsonl').events.length, 3)
+  // The importer derives the failure from the last tool call, MCP server included.
+  const imported = fromTrace(trace, '/tmp/session.jsonl', 'session.jsonl')
+  assert.deepEqual(imported.reproduce.trace.tool_call, { name: 'create_pr', server: 'github', arguments: { title: { contains: 'fix' } } })
+  // One record per content block under the same message id is one turn, counted once.
+  const split = parseTrace(
+    [
+      '{"type":"assistant","message":{"id":"m1","role":"assistant","model":"m","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":5,"output_tokens":1}}}',
+      '{"type":"assistant","message":{"id":"m1","role":"assistant","model":"m","content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":5,"output_tokens":1}}}',
+    ].join('\n'),
+  )
+  assert.deepEqual(split.events.map((e) => [e.type, e.step]), [['model', 1], ['message', 1], ['tool_call', 1]])
+  assert.equal(split.events[0].output, 'Hi')
+  assert.equal(split.usage.total_tokens, 6)
+})

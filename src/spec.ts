@@ -17,6 +17,7 @@ import {
   type OutputMatcher,
   type TraceMatcher,
 } from './agent.js'
+import { changedFiles, type FileChanges } from './evidence.js'
 
 // ---------------------------------------------------------------- matchers
 
@@ -41,6 +42,11 @@ export type Matcher = {
   output?: OutputMatcher
   duration_ms?: NumberMatcher
   usage?: AgentMatcher['usage']
+  /**
+   * Shell and agent steps: every listed substring must appear in the path of
+   * a file the step added, modified or deleted in the git working tree.
+   */
+  files_changed?: string | string[]
 }
 
 /** Uniform outcome shape across every step kind, so one Matcher covers all. */
@@ -63,6 +69,8 @@ export type Observed = {
   /** Other files this step left behind (agent traces, dumps). */
   artifacts?: string[]
   trace?: AgentTrace
+  /** What the step did to the git working tree. Shell and agent steps, in a repository. */
+  files?: FileChanges
 }
 
 // ------------------------------------------------------------------- steps
@@ -462,6 +470,15 @@ export function matchOutcome(m: Matcher, o: Observed, logs = ''): MatchResult {
   }
   if (m.trace || m.output || m.duration_ms !== undefined || m.usage) {
     reasons.push(...matchAgent(m, o.trace, o.duration_ms))
+  }
+  if (m.files_changed !== undefined) {
+    const changed = o.files ? changedFiles(o.files) : undefined
+    if (!changed) reasons.push('file changes were not observed on this step (not a git repository, or not a shell/agent step)')
+    else {
+      for (const want of [m.files_changed].flat()) {
+        if (!changed.some((f) => f.includes(want))) reasons.push(`no changed file containing ${JSON.stringify(want)}`)
+      }
+    }
   }
 
   return { ok: reasons.length === 0, reasons }

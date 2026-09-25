@@ -13,6 +13,8 @@ import { bisect } from './bisect.js'
 import { establish, seal, SealError, status, verify } from './seal.js'
 import { detectProject, importEvidence, scaffold, type Imported } from './compile.js'
 import { DEFAULT_MAX_ATTEMPTS, HookError, install as installHook, snippet, stopHook } from './hook.js'
+import { inWorktree } from './worktree.js'
+import { VERSION } from './version.js'
 import {
   bold,
   cyan,
@@ -30,8 +32,6 @@ import {
   yellow,
 } from './report.js'
 
-const VERSION = '0.2.0'
-
 const OPTIONS = {
   json: { type: 'boolean' as const, default: false },
   repeat: { type: 'string' as const },
@@ -40,6 +40,7 @@ const OPTIONS = {
   timeout: { type: 'string' as const },
   spec: { type: 'string' as const },
   root: { type: 'string' as const },
+  worktree: { type: 'string' as const },
   'base-url': { type: 'string' as const },
   'max-attempts': { type: 'string' as const },
   install: { type: 'boolean' as const, default: false },
@@ -145,6 +146,7 @@ async function cmdInit(positionals: string[], flags: Flags): Promise<number> {
       baseUrl: imported?.baseUrl,
       raw: imported?.raw,
       source: imported?.source,
+      traceFile: imported?.traceFile,
     },
     { force: flags.force, complete: Boolean(imported?.scenario?.length) },
   )
@@ -169,9 +171,16 @@ async function cmdInit(positionals: string[], flags: Flags): Promise<number> {
   process.stdout.write(
     [
       '',
-      `${bold('detected')}  ${[facts.framework, facts.language, facts.packageManager, facts.database]
-        .filter(Boolean)
-        .join(', ')}`,
+      `${bold('detected')}  ${
+        [
+          facts.framework,
+          facts.language !== 'unknown' && facts.language,
+          facts.language !== 'unknown' && facts.packageManager,
+          facts.database,
+        ]
+          .filter(Boolean)
+          .join(', ') || dim('nothing (no package.json)')
+      }`,
       facts.devCommand ? `${bold('start')}     ${facts.devCommand}` : dim('start     unknown'),
       facts.baseUrl ? `${bold('base url')}  ${facts.baseUrl}` : dim('base url  unknown'),
       '',
@@ -193,7 +202,7 @@ async function cmdInit(positionals: string[], flags: Flags): Promise<number> {
 async function cmdFrom(positionals: string[], flags: Flags): Promise<number> {
   const file = positionals[0]
   if (!file) {
-    process.stderr.write(`${red('error:')} repro from <file.md|.log|.har|.curl|.txt>\n`)
+    process.stderr.write(`${red('error:')} repro from <file.md|.log|.har|.curl|.txt|.jsonl>\n`)
     return 2
   }
   if (!existsSync(path.resolve(file))) {
@@ -210,19 +219,22 @@ async function cmdRun(flags: Flags): Promise<number> {
   // --quiet drops the running commentary; the verdict is the point of the
   // command and survives everything except --json.
   const quiet = flags.quiet === true || flags.json === true
-  if (!quiet) process.stdout.write(`${bold('REPRO')} ${loaded.spec.name}\n`)
+  if (!quiet) process.stdout.write(`${bold('REPRO')} ${loaded.spec.name}${flags.worktree ? dim(`  @ ${flags.worktree}`) : ''}\n`)
 
-  const result = await runReproduction(loaded, {
-    repeat: num(flags.repeat) ?? 1,
-    baseUrl: flags['base-url'],
-    trace: flags.trace,
-    headed: flags.headed,
-    timeoutMs: num(flags.timeout),
-    onPhase: (phase, status, detail) => {
-      if (quiet || status === 'start') return
-      process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
-    },
-  })
+  const result = await at(loaded, flags, (l) =>
+    runReproduction(l, {
+      repeat: num(flags.repeat) ?? 1,
+      baseUrl: flags['base-url'],
+      trace: flags.trace,
+      headed: flags.headed,
+      timeoutMs: num(flags.timeout),
+      version: VERSION,
+      onPhase: (phase, status, detail) => {
+        if (quiet || status === 'start') return
+        process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
+      },
+    }),
+  )
 
   if (flags.json) process.stdout.write(`${JSON.stringify(toJson(result), null, 2)}\n`)
   else process.stdout.write(`${renderRun(result)}\n\n`)
@@ -263,7 +275,14 @@ function toJson(result: RepeatResult) {
       : undefined,
     error: result.error,
     artifacts: result.artifacts,
+    environment: result.environment,
+    coverage: result.coverage,
   }
+}
+
+/** Run against `--worktree <ref>` when given, otherwise against the tree as it is. */
+function at<T>(loaded: LoadedSpec, flags: Flags, fn: (loaded: LoadedSpec) => Promise<T>): Promise<T> {
+  return flags.worktree ? inWorktree(loaded, flags.worktree, fn) : fn(loaded)
 }
 
 // ------------------------------------------------- establish / seal / verify
@@ -315,16 +334,18 @@ async function cmdVerify(flags: Flags): Promise<number> {
   const quiet = flags.quiet === true || flags.json === true
   if (!quiet) process.stdout.write(`${bold('VERIFY')} ${loaded.spec.name}\n`)
 
-  const report = await verify(loaded, {
-    repeat: num(flags.repeat),
-    baseUrl: flags['base-url'],
-    timeoutMs: num(flags.timeout),
-    version: VERSION,
-    onPhase: (phase, status, detail) => {
-      if (quiet || status === 'start') return
-      process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
-    },
-  })
+  const report = await at(loaded, flags, (l) =>
+    verify(l, {
+      repeat: num(flags.repeat),
+      baseUrl: flags['base-url'],
+      timeoutMs: num(flags.timeout),
+      version: VERSION,
+      onPhase: (phase, status, detail) => {
+        if (quiet || status === 'start') return
+        process.stdout.write(`${phaseLine(phase, status)}${detail ? `  ${dim(detail)}` : ''}\n`)
+      },
+    }),
+  )
 
   if (flags.json) {
     const { result: _full, ...summary } = report
@@ -644,6 +665,7 @@ ${bold('OPTIONS')}
   --timeout <ms>         Per-step timeout, default 30000          (all)
   --spec <file>          Use a specific spec file                 (all)
   --root <dir>           Project root, default the spec's parent  (all)
+  --worktree <ref>       Run against that commit in a temp worktree (run, verify)
   --force                Overwrite existing files                 (init, export)
   --quiet                Drop progress output, keep the verdict   (all)
   --install / --print    Write the Stop hook, or show it          (hook)
@@ -661,6 +683,8 @@ ${bold('EXAMPLES')}
   repro status              ${dim('# has the contract moved? no application boot')}
   repro hook --install      ${dim('# gate every stop on the reproduction')}
   repro run --base-url http://localhost:3000   ${dim('# reuse the app already running')}
+  repro run --worktree v2.4.1  ${dim('# the same contract against another commit')}
+  repro from trace.jsonl       ${dim('# an agent trace becomes a reproduction')}
   repro export --test       ${dim('# retire the spec into a real regression test')}
   repro run --json          ${dim('# what your coding agent should loop on')}
 `
