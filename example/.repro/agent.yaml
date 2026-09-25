@@ -20,6 +20,12 @@ scenario:
       # stochastic bug instead.
       env:
         AGENT_BUG_RATE: "1"
+      # Reproduction mode: pin the planner's decision to a recording and run
+      # the tools live. The agent reads REPRO_REPLAY; repro only sets it.
+      # replay: .repro/runs/latest/traces/01.json
+      # Or the other direction: the agent saves the decision it made under
+      # this run's recordings/, ready to be the next run's `replay:`.
+      # record: true
 
 # What "reproduced" means for this bug: the agent refunded, and it did so
 # without ever looking the order up.

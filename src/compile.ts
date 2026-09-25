@@ -8,9 +8,10 @@
  * model-independent: no API key, no vendor, no hidden inference.
  */
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { dumpSpec, REPRO_DIR, SPEC_FILE, type Matcher, type Spec, type Step } from './spec.js'
+import { parseTrace, type AgentTrace, type EventMatcher } from './agent.js'
 
 // ------------------------------------------------------------- repo facts
 
@@ -90,8 +91,13 @@ export async function detectProject(root: string): Promise<ProjectFacts> {
   else if (existsSync(path.join(root, 'yarn.lock'))) facts.packageManager = 'yarn'
   else if (existsSync(path.join(root, 'bun.lockb'))) facts.packageManager = 'bun'
 
+  // No package.json is no evidence of JavaScript, let alone of a package manager.
   facts.language =
-    existsSync(path.join(root, 'tsconfig.json')) || 'typescript' in deps ? 'typescript' : 'javascript'
+    existsSync(path.join(root, 'tsconfig.json')) || 'typescript' in deps
+      ? 'typescript'
+      : existsSync(pkgPath)
+        ? 'javascript'
+        : 'unknown'
 
   for (const [dep, name] of FRAMEWORKS) {
     if (dep in deps) {
@@ -188,11 +194,16 @@ export type DraftInput = {
   baseUrl?: string
   raw?: string
   source?: string
+  /** An imported agent trace, copied under `.repro/fixtures/` so the seal covers it. */
+  traceFile?: string
 }
 
 export function draftSpec(input: DraftInput): Spec {
   const { facts } = input
   const setup: Step[] = facts.setupCommands.map((command) => ({ shell: command }))
+  // An HTTP bug has an obvious "fixed" shape; an agent bug does not, and
+  // `expect: { status: 200 }` on a trace would be a lie the export repeats.
+  const expect = input.expect ?? (input.scenario?.some((s) => s.agent) ? undefined : { status: 200 })
   const spec: Spec = {
     name: slugify(input.description),
     description: input.description.trim(),
@@ -220,7 +231,7 @@ export function draftSpec(input: DraftInput): Spec {
             },
           ],
     failure: {
-      expect: input.expect ?? { status: 200 },
+      ...(expect ? { expect } : {}),
       reproduce: input.reproduce ?? { status: 500 },
     },
   }
@@ -250,6 +261,15 @@ export async function scaffold(
   const spec = draftSpec(input)
   await mkdir(path.join(reproDir, 'fixtures'), { recursive: true })
   await mkdir(path.join(reproDir, 'scripts'), { recursive: true })
+  if (input.traceFile) {
+    // The evidence travels with the spec: fixtures are hashed into the seal,
+    // and a trace_file that points outside the repository is not a fixture.
+    const copy = path.resolve(reproDir, 'fixtures', path.basename(input.traceFile))
+    // copyFile truncates before it reads: re-importing from fixtures/ itself would empty the trace.
+    if (path.resolve(input.traceFile) !== copy) await copyFile(input.traceFile, copy)
+    const rel = path.relative(root, copy).split(path.sep).join('/')
+    for (const step of spec.scenario) if (step.agent?.trace_file === TRACE_PLACEHOLDER) step.agent.trace_file = rel
+  }
   await writeFile(specPath, header(input) + dumpSpec(spec))
 
   let reportPath: string | undefined
@@ -301,15 +321,37 @@ function header(input: DraftInput): string {
 
 function briefing(input: DraftInput, spec: Spec, complete: boolean): string {
   const f = input.facts
-  const todo = complete
-    ? []
-    : [
-        '## What repro could not infer',
+  const traced = spec.scenario.find((s) => s.agent?.trace_file)
+  const todo = traced
+    ? [
+        '## The trace was imported',
         '',
-        'The scenario below is a stub. Replace it with the real sequence of',
-        'actions that triggers the bug. Everything else was detected from the repo.',
+        `The agent step reads its trajectory from \`${traced.agent!.trace_file}\`, so \`repro run\``,
+        'already reproduces — from the recording. That proves `failure.reproduce` describes',
+        'the failure in the evidence. It does not prove the live agent still does it.',
+        '',
+        'To reproduce against the live agent, add `run:` to the step and remove',
+        '`trace_file`. `input` is handed to the command as one JSON line on stdin.',
+        '',
+        '```yaml',
+        '    agent:',
+        '      run: node agents/support.mjs',
+        '      # Claude Code: claude -p "<prompt>" --output-format stream-json --verbose',
+        '```',
+        '',
+        'Narrow `failure.reproduce` first: it was derived from the last tool call and',
+        'will match any run that reaches it.',
         '',
       ]
+    : complete
+      ? []
+      : [
+          '## What repro could not infer',
+          '',
+          'The scenario below is a stub. Replace it with the real sequence of',
+          'actions that triggers the bug. Everything else was detected from the repo.',
+          '',
+        ]
 
   return `# Compile this reproduction
 
@@ -326,7 +368,7 @@ ${complete ? 'Steps were extracted from the supplied evidence.' : 'The scenario 
 | --- | --- |
 | framework | ${f.framework ?? 'unknown'} |
 | language | ${f.language} |
-| package manager | ${f.packageManager} |
+| package manager | ${f.language === 'unknown' ? 'unknown' : f.packageManager} |
 | start command | ${f.devCommand ?? 'unknown'} |
 | base url | ${spec.base_url ?? 'unknown'} |
 | database | ${f.database ?? 'none detected'} |
@@ -393,7 +435,8 @@ scenario:
 
 \`status\`, \`status_in\`, \`status_not\`, \`body_contains\`, \`body_matches\` (regex),
 \`json\` (map of \`$.path\` to expected value), \`exception\`, \`exit_code\`,
-\`stdout_contains\`, \`stderr_contains\`, \`logs_contain\`.
+\`stdout_contains\`, \`stderr_contains\`, \`logs_contain\`, and for shell and agent
+steps in a git repository \`files_changed\` (substrings of paths the step touched).
 
 For agent steps, also \`trace\`, \`output\`, \`duration_ms\` and \`usage\`:
 
@@ -402,6 +445,7 @@ reproduce:
   trace:
     tool_call:
       name: refund_order
+      server: payments                   # only MCP calls from that server
       arguments: { amount: { greater_than: 100 } }
       count: { greater_than: 10 }        # omit for "at least once"
     sequence:
@@ -410,6 +454,7 @@ reproduce:
   output: { schema: { valid: false } }   # needs output_schema on the step
   usage: { total_tokens: { greater_than: 50000 } }
   duration_ms: { greater_than: 10000 }
+  files_changed: [src/auth.ts]           # the agent edited that file
 \`\`\`
 
 Comparators: \`equals\`, \`not_equals\`, \`greater_than\`, \`greater_than_or_equal\`,
@@ -442,6 +487,8 @@ export type Imported = {
   raw?: string
   source: string
   notes: string[]
+  /** Absolute path of an imported agent trace; scaffold copies it into fixtures. */
+  traceFile?: string
 }
 
 export async function importEvidence(file: string): Promise<Imported> {
@@ -451,7 +498,65 @@ export async function importEvidence(file: string): Promise<Imported> {
 
   if (ext === '.har' || text.trimStart().startsWith('{"log"')) return fromHar(text, base)
   if (ext === '.curl' || /^\s*curl\s/.test(text)) return fromCurl(text, base)
+  if (/^\.(jsonl?|log|txt)$/.test(ext)) {
+    // A log full of JSON lines is a trace only if it holds events; an
+    // `output` field alone is too common a word to claim a file on.
+    const trace = parseTrace(text)
+    if (trace.events.length || (ext.startsWith('.json') && trace.output !== undefined)) {
+      return fromTrace(trace, path.resolve(file), base)
+    }
+  }
   return fromText(text, base)
+}
+
+/** Filled in by scaffold once the trace has been copied under `.repro/fixtures/`. */
+export const TRACE_PLACEHOLDER = '<trace>'
+
+/**
+ * An agent trace — JSONL, a whole trace, or a Claude Code stream — becomes a
+ * reproduction that reads it back. `repro run` then reproduces from the
+ * recording, which proves the matcher describes the failure in the
+ * evidence; making the live agent do it again is the agent's next job.
+ */
+export function fromTrace(trace: AgentTrace, file: string, source: string): Imported {
+  const notes: string[] = []
+  const calls = trace.events.filter((e) => e.type === 'tool_call')
+  const last = calls.at(-1) ?? trace.events.at(-1)
+
+  let reproduce: Matcher
+  if (last?.type === 'tool_call') {
+    const matcher: EventMatcher = { name: last.name, ...(last.server ? { server: last.server } : {}) }
+    // Short string arguments are the specific part of a tool call — the
+    // command, the path — and are worth pinning; anything else is noise.
+    const args = Object.entries((last.input as Record<string, unknown> | null) ?? {}).filter(
+      ([, v]) => typeof v === 'string' && v.length > 0 && v.length <= 80,
+    )
+    if (args.length) matcher.arguments = Object.fromEntries(args.map(([k, v]) => [k, { contains: v }]))
+    reproduce = { trace: { tool_call: matcher } }
+    notes.push(`\`failure.reproduce\` was derived from the last tool call (${last.name}) — narrow it`)
+  } else if (trace.output !== undefined) {
+    const text = typeof trace.output === 'string' ? trace.output : JSON.stringify(trace.output)
+    reproduce = { output: { contains: text.slice(0, 60) } }
+    notes.push('no tool calls in the trace — `failure.reproduce` matches on the output, narrow it')
+  } else {
+    reproduce = { trace: { event: { type: last!.type, ...(last!.name ? { name: last!.name } : {}) } } }
+    notes.push('`failure.reproduce` was derived from the last event — narrow it')
+  }
+
+  const step: Step = {
+    id: 'agent',
+    name: `agent run from ${source}`,
+    agent: { ...(trace.input !== undefined ? { input: trace.input } : {}), trace_file: TRACE_PLACEHOLDER },
+  }
+  notes.push('`repro run` reproduces from the recorded trace; add `run:` to reproduce against the live agent')
+  return {
+    scenario: [step],
+    reproduce,
+    description: `Imported agent trace from ${source} (${trace.events.length} events, ${calls.length} tool calls).`,
+    source,
+    notes,
+    traceFile: file,
+  }
 }
 
 const ASSET = /\.(css|js|mjs|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm)(\?|$)/i

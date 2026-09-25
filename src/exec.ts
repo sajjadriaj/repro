@@ -3,7 +3,7 @@
  * service supervisor that brings the application under test up and down.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rmdir } from 'node:fs/promises'
 import net from 'node:net'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -20,7 +20,7 @@ import {
 } from './spec.js'
 import YAML from 'yaml'
 import { parseTrace, validateJsonSchema, type AgentTrace } from './agent.js'
-import { clip, type NetworkEntry, type RunDir } from './evidence.js'
+import { clip, diffSnapshots, treeSnapshot, type NetworkEntry, type RunDir } from './evidence.js'
 
 export type ExecContext = {
   root: string
@@ -36,6 +36,12 @@ export type ExecContext = {
   headed: boolean
   browser?: BrowserSession
   onLog?: (line: string) => void
+  /**
+   * Top of the git repository containing `root`, when file changes should be
+   * observed around shell and agent steps. Unset outside a repository and for
+   * evidence-free probes.
+   */
+  gitTop?: string
 }
 
 // ------------------------------------------------------------------- steps
@@ -45,6 +51,11 @@ export async function runStep(rawStep: Step, index: number, ctx: ExecContext): P
   const label = stepLabel(step, index)
   const kind = stepKindOf(step)
   const started = Date.now()
+
+  // The physical layer: what this step did to the repository, observed from
+  // the outside. Only steps that run a process can mutate the tree.
+  const before =
+    ctx.gitTop && (kind === 'shell' || kind === 'agent') ? await treeSnapshot(ctx.root, ctx.gitTop) : undefined
 
   let observed: Observed
   try {
@@ -84,6 +95,7 @@ export async function runStep(rawStep: Step, index: number, ctx: ExecContext): P
 
   observed.label = label
   observed.duration_ms = Date.now() - started
+  if (before) observed.files = diffSnapshots(before, await treeSnapshot(ctx.root, ctx.gitTop!))
 
   // Capture variables for later steps.
   for (const [name, expr] of Object.entries(step.save ?? {})) {
@@ -175,10 +187,21 @@ async function execAgent(step: Step, index: number, ctx: ExecContext): Promise<O
   let exitCode: number | undefined
   let error: string | undefined
 
+  // The record/replay contract. repro never proxies the model; it tells the
+  // harness where a recording is, or where to put one, and the harness does
+  // the rest. The coverage names the recording; honouring it is the
+  // harness's half of the contract, which repro cannot check.
+  const contract: Record<string, string> = {}
+  if (spec.replay) contract.REPRO_REPLAY = path.resolve(ctx.root, spec.replay)
+  if (spec.record) {
+    contract.REPRO_RECORD = ctx.run.file('recordings')
+    await mkdir(contract.REPRO_RECORD, { recursive: true }).catch(() => undefined)
+  }
+
   if (spec.run) {
     const result = await spawnCapture(spec.run, {
       cwd,
-      env: { ...process.env, ...ctx.env, ...spec.env } as NodeJS.ProcessEnv,
+      env: { ...process.env, ...ctx.env, ...spec.env, ...contract } as NodeJS.ProcessEnv,
       timeoutMs: spec.timeout_ms ?? ctx.stepTimeoutMs,
       input: spec.input === undefined ? undefined : `${JSON.stringify(spec.input)}\n`,
     })
@@ -204,7 +227,7 @@ async function execAgent(step: Step, index: number, ctx: ExecContext): Promise<O
     })
   }
 
-  const trace: AgentTrace = parseTrace(raw)
+  const trace: AgentTrace = parseTrace(raw, spec.format)
   trace.input ??= spec.input
   trace.duration_ms ??= Date.now() - started
   if (spec.output_schema !== undefined) {
@@ -220,6 +243,14 @@ async function execAgent(step: Step, index: number, ctx: ExecContext): Promise<O
   const file = await ctx.run
     .write(path.join('traces', `${String(index + 1).padStart(2, '0')}.json`), JSON.stringify(trace, null, 2))
     .catch(() => undefined)
+  const recordings = contract.REPRO_RECORD
+    ? await readdir(contract.REPRO_RECORD)
+        .then((names) => names.map((n) => path.join(contract.REPRO_RECORD!, n)))
+        .catch(() => [])
+    : []
+  // An empty recordings/ is not evidence of anything; an agent that ignored
+  // REPRO_RECORD leaves no directory behind.
+  if (contract.REPRO_RECORD && !recordings.length) await rmdir(contract.REPRO_RECORD).catch(() => undefined)
 
   return {
     kind: 'agent',
@@ -233,7 +264,7 @@ async function execAgent(step: Step, index: number, ctx: ExecContext): Promise<O
     body: clip(stdout),
     exit_code: exitCode,
     error,
-    artifacts: file ? [file] : undefined,
+    artifacts: file || recordings.length ? [...(file ? [file] : []), ...recordings] : undefined,
     duration_ms: 0,
   }
 }

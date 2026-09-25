@@ -8,5 +8,16 @@ export * from './bisect.js'
 export * from './seal.js'
 export * from './agent.js'
 export * from './hook.js'
-export { newRunDir, type NetworkEntry, type RunDir } from './evidence.js'
-export { renderRun, renderMinimize, renderExplain, renderEstablish, renderSeal, renderVerify, renderStatus } from './report.js'
+export * from './worktree.js'
+export * from './integrations/claude-code.js'
+export { VERSION } from './version.js'
+export {
+  newRunDir,
+  treeSnapshot,
+  diffSnapshots,
+  changedFiles,
+  type FileChanges,
+  type NetworkEntry,
+  type RunDir,
+} from './evidence.js'
+export { renderRun, renderCoverage, renderMinimize, renderExplain, renderEstablish, renderSeal, renderVerify, renderStatus } from './report.js'

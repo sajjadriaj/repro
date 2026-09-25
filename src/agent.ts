@@ -9,8 +9,11 @@
  *
  * This module is deliberately free of framework knowledge and of repro's own
  * execution code: it defines the normalized trace, parses one out of whatever
- * the agent printed, and matches it. Nothing here imports an SDK.
+ * the agent printed, and matches it. Nothing here imports an SDK. The one
+ * integration it knows the name of lives under integrations/ and only maps
+ * a native stream onto these events.
  */
+import { fromClaudeCode, isClaudeCodeStream } from './integrations/claude-code.js'
 
 // ------------------------------------------------------------- trace model
 
@@ -30,7 +33,22 @@ export type AgentEvent = {
   input?: unknown
   output?: unknown
   timestamp?: number
+  /**
+   * MCP server the tool lives on. An MCP call is a tool call with a
+   * transport, not a different kind of event; `mcp_call` / `mcp_result`
+   * normalize to `tool_call` / `tool_result` with this set.
+   */
+  server?: string
+  /** Model identifier, when a `model` event reports one. */
+  model?: string
+  /** Agent turn this event belongs to, when the emitter groups by step. */
+  step?: number
 }
+
+/** Enough of an event to say whether two trajectories took the same path. */
+export type EventKey = Pick<AgentEvent, 'type' | 'name' | 'server'>
+
+export type TraceFormat = 'jsonl' | 'claude-code'
 
 export type AgentUsage = {
   input_tokens?: number
@@ -65,6 +83,17 @@ export type AgentStep = {
   /** JSON Schema the final output is expected to satisfy. */
   output_schema?: string | Record<string, unknown>
   timeout_ms?: number
+  /** How to read the trace. Detected when omitted; set it when detection is wrong. */
+  format?: TraceFormat
+  /**
+   * Reproduction mode. Exported to the agent as `REPRO_REPLAY=<absolute path>`;
+   * a harness that honours it takes its model decisions from this recording
+   * and runs everything else live. repro does not proxy the model — it hands
+   * the file over and reports, in the coverage, that it did.
+   */
+  replay?: string
+  /** Exported as `REPRO_RECORD=<dir>`: where a harness should save what it would replay. */
+  record?: boolean
 }
 
 const EVENT_TYPES = new Set<string>([
@@ -78,11 +107,34 @@ const EVENT_TYPES = new Set<string>([
 ])
 
 /**
- * Parse whatever the agent produced. Accepts a whole trace as one JSON
- * object, or JSONL with one event per line — and ignores lines that are not
- * JSON, because agents log.
+ * Spellings other emitters use for the same seven things. A model request
+ * and its response are one `model` event with `input` and `output`; an MCP
+ * call is a `tool_call` that carries a `server`.
  */
-export function parseTrace(text: string): AgentTrace {
+const TYPE_ALIASES: Record<string, AgentEventType> = {
+  'model.request': 'model',
+  model_request: 'model',
+  'model.response': 'model',
+  model_response: 'model',
+  llm: 'model',
+  'tool.call': 'tool_call',
+  tool_use: 'tool_call',
+  'tool.result': 'tool_result',
+  'mcp.call': 'tool_call',
+  mcp_call: 'tool_call',
+  'mcp.result': 'tool_result',
+  mcp_result: 'tool_result',
+}
+
+const STEP_MARKERS = new Set(['agent.step', 'agent_step', 'step'])
+
+/**
+ * Parse whatever the agent produced. Accepts a whole trace as one JSON
+ * object, a JSON array, or JSONL with one event per line — and ignores
+ * lines that are not JSON, because agents log. Claude Code's stream is
+ * recognized by shape and normalized through its integration.
+ */
+export function parseTrace(text: string, format?: TraceFormat): AgentTrace {
   const trimmed = text.trim()
   if (!trimmed) return { events: [] }
 
@@ -90,25 +142,50 @@ export function parseTrace(text: string): AgentTrace {
   if (whole && typeof whole === 'object' && !Array.isArray(whole) && 'events' in whole) {
     return normalizeTrace(whole as Record<string, unknown>)
   }
-  if (Array.isArray(whole)) return { events: whole.map(normalizeEvent).filter(isEvent) }
+  const raw = Array.isArray(whole) ? whole : trimmed.split('\n').map((line) => tryJson(line.trim()))
+  const records = raw.filter(isRecord)
+  if (format === 'claude-code' || (format === undefined && isClaudeCodeStream(records))) {
+    return fromClaudeCode(records)
+  }
+  return fromRecords(records)
+}
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function fromRecords(records: Record<string, unknown>[]): AgentTrace {
   const trace: AgentTrace = { events: [] }
-  for (const line of trimmed.split('\n')) {
-    const parsed = tryJson(line.trim())
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
-    const record = parsed as Record<string, unknown>
+  let step: number | undefined
+  for (const record of records) {
+    const type = typeof record.type === 'string' ? record.type : undefined
     // A line that carries the final answer rather than an event.
-    if (record.type === 'output' || (record.output !== undefined && record.type === undefined)) {
+    if (type === 'output' || (record.output !== undefined && type === undefined)) {
       trace.output = record.output
       if (record.usage) trace.usage = record.usage as AgentUsage
       continue
     }
-    if (record.type === 'usage') {
+    if (type === 'usage') {
       trace.usage = (record.usage ?? record) as AgentUsage
       continue
     }
+    if (type && STEP_MARKERS.has(type)) {
+      const n = record.step ?? record.index ?? record.n
+      step = typeof n === 'number' ? n : (step ?? 0) + 1
+      continue
+    }
     const event = normalizeEvent(record)
-    if (isEvent(event)) trace.events.push(event)
+    if (!event) continue
+    if (event.step === undefined && step !== undefined) event.step = step
+    // A response line completes the request line before it rather than
+    // standing as a second model event; `count` would otherwise double.
+    const last = trace.events.at(-1)
+    if (/response$/.test(type ?? '') && event.type === 'model' && last?.type === 'model' && last.output === undefined) {
+      last.output = event.output
+      last.model ??= event.model
+      continue
+    }
+    trace.events.push(event)
   }
   return trace
 }
@@ -127,16 +204,54 @@ function normalizeTrace(raw: Record<string, unknown>): AgentTrace {
 function normalizeEvent(raw: unknown): AgentEvent | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const r = raw as Record<string, unknown>
-  const type = typeof r.type === 'string' ? r.type : undefined
-  if (!type || !EVENT_TYPES.has(type)) return undefined
+  const spelled = typeof r.type === 'string' ? r.type : undefined
+  const type = spelled ? (EVENT_TYPES.has(spelled) ? spelled : TYPE_ALIASES[spelled]) : undefined
+  if (!type) return undefined
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined)
+  const server = str(r.server ?? r.mcp_server) ?? (spelled!.startsWith('mcp') ? 'mcp' : undefined)
   return {
     type: type as AgentEventType,
-    name: typeof r.name === 'string' ? r.name : typeof r.tool === 'string' ? r.tool : undefined,
+    name: str(r.name) ?? str(r.tool),
     // Frameworks disagree on the word; both mean "what the tool was called with".
     input: r.input ?? r.arguments ?? r.args,
-    output: r.output ?? r.result,
+    output: r.output ?? r.result ?? (/response$/.test(spelled!) ? r.response : undefined),
     timestamp: typeof r.timestamp === 'number' ? r.timestamp : undefined,
+    ...(server !== undefined ? { server } : {}),
+    ...(str(r.model) !== undefined ? { model: str(r.model) } : {}),
+    ...(typeof r.step === 'number' ? { step: r.step } : {}),
   }
+}
+
+// -------------------------------------------------------------- divergence
+
+export function describeEvent(e: EventKey): string {
+  return `${e.type}${e.name ? ` ${e.name}` : ''}${e.server ? ` @${e.server}` : ''}`
+}
+
+export function compactEvents(events: AgentEvent[]): EventKey[] {
+  return events.map((e) => ({
+    type: e.type,
+    ...(e.name !== undefined ? { name: e.name } : {}),
+    ...(e.server !== undefined ? { server: e.server } : {}),
+  }))
+}
+
+export type Divergence = { index: number; left?: EventKey; right?: EventKey }
+
+/**
+ * The first event at which two trajectories part ways, or undefined when
+ * they took the same path. Positional on purpose: "the first meaningful
+ * divergence" is the earliest decision that differed, and everything after
+ * it is downstream of that decision.
+ */
+export function firstDivergence(a: EventKey[], b: EventKey[]): Divergence | undefined {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const l = a[i]
+    const r = b[i]
+    if (l && r && l.type === r.type && l.name === r.name && l.server === r.server) continue
+    return { index: i, left: l, right: r }
+  }
+  return undefined
 }
 
 function isEvent(e: AgentEvent | undefined): e is AgentEvent {
@@ -191,6 +306,8 @@ export type EventMatcher = {
   type?: AgentEventType
   name?: string
   name_matches?: string
+  /** MCP server the tool must have come from. */
+  server?: string
   /** Matched against the event's `input` (tool arguments). */
   arguments?: Record<string, ValueMatcher>
   output?: Record<string, ValueMatcher>
@@ -296,7 +413,9 @@ function matchEvents(
   events: AgentEvent[],
   label: string,
 ): string[] {
-  const ofType = type ? events.filter((e) => e.type === type) : events
+  const ofType = (type ? events.filter((e) => e.type === type) : events).filter(
+    (e) => m.server === undefined || e.server === m.server,
+  )
   const named = m.name
     ? ofType.filter((e) => e.name === m.name)
     : m.name_matches
@@ -314,7 +433,9 @@ function matchEvents(
     else if (argReasons.length === 0) argReasons.push(...failed)
   }
 
-  const describe = `${label}${m.name ? ` "${m.name}"` : m.name_matches ? ` /${m.name_matches}/` : ''}`
+  const describe = `${label}${m.name ? ` "${m.name}"` : m.name_matches ? ` /${m.name_matches}/` : ''}${
+    m.server ? ` @${m.server}` : ''
+  }`
   if (m.count !== undefined) {
     const reason = matchNumber(m.count, matching.length, `${describe} count`)
     return reason ? [reason] : []

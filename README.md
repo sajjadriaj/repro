@@ -225,7 +225,23 @@ Confidence:
   HIGH
 Evidence:
   .repro/runs/0007/
+Coverage:
+  ✓ repository state      git 67071a9, uncommitted changes in repo.patch
+  ✓ filesystem mutations  no files changed
+  ~ subprocesses          exit codes and output captured; process trees are not observed
+  ✓ HTTP responses        12 exchanges repro drove, in network.json
+  ! outbound network      calls the application or agent makes are not recorded
+  ✓ environment           os, runtime and lockfiles fingerprinted; environment variables never recorded
+  ~ randomness            time and randomness are not controlled; --repeat measures the rate
+  ✓ application           started by repro: app
 ```
+
+**Coverage** is evidence about the evidence: which layers of the execution
+this run recorded (`✓`), which it could only see in part (`~`), and which it
+does not control (`!`). It is derived from what the run actually wrote, so a
+layer is captured because the file is there, not because the feature exists.
+It is deliberately not a percentage — "87% reproducible" would have to invent
+the weights.
 
 When the bug does not reproduce, repro says which clause failed to match rather
 than just printing a verdict:
@@ -417,6 +433,24 @@ Without one it reports the change and stops there. A modified contract exits `2`
 whatever the runs said, because the comparison is no longer between like and
 like.
 
+For an agent bug the seal also keeps the trajectory of a run that reproduced,
+so verify can say where the fixed agent left the bug path instead of only that
+the rate moved:
+
+```
+Trajectory:
+  diverges from the sealed bug path at event 2
+  sealed:   tool_call refund_order
+  current:  tool_call get_order
+```
+
+`verify` always runs against the working tree as it is — that is the question
+"does my current change fix this real failure". The inverse is
+`--worktree <ref>`: the same contract, the same evidence directory, against
+another commit checked out in a temporary worktree. `node_modules` is
+borrowed, not reinstalled, and so is today's `.repro/` when the ref has none:
+the spec, its fixtures and its recordings are not checked out with the code.
+
 ### repro status
 
 Where the reproduction stands, without running it.
@@ -552,6 +586,26 @@ Three things are happening here, all deterministic:
 repro deliberately stops short of naming a cause. Its job is to hand the agent a
 much smaller haystack.
 
+An agent failure diverges *inside* one step rather than between steps, so for
+an `agent` failure step explain looks for a run that did not take the bug path
+and reports the first event where the two part ways — with what each run did to
+the working tree beside it, so the decision and its physical consequence are
+read together:
+
+```
+Trajectory divergence:
+  at event 2
+    reproduced:      tool_call refund_order
+    not reproduced:  tool_call get_order
+Files changed (reproduced):
+  ~ src/auth.ts
+Files changed (not reproduced):
+  (no files changed)
+```
+
+A deterministic agent bug never yields a clean run; explain says so after
+three attempts and stops, because every attempt may cost real model calls.
+
 ### repro from
 
 ```bash
@@ -559,6 +613,7 @@ repro from issue.md
 repro from production.log
 repro from request.curl
 repro from checkout.har
+repro from incident.jsonl
 ```
 
 - **HAR** becomes HTTP steps, with assets stripped and everything recorded after
@@ -567,6 +622,14 @@ repro from checkout.har
   `-u` and `--data-raw`.
 - **Free text** gives up its stack traces, error messages, embedded curl
   commands, and `POST /api/checkout 500` log lines.
+- **An agent trace** — JSONL events, a whole trace, or a Claude Code session —
+  becomes an `agent` step that reads the recording back, with
+  `failure.reproduce` derived from the last tool call. The file is copied
+  under `.repro/fixtures/` so the seal covers it. `repro run` then reproduces
+  from the recording, which proves the matcher describes the failure in the
+  evidence; adding `run:` and dropping `trace_file` makes the live agent do it
+  again. That is the incident → fixture arc for agents, and it ends at
+  `export --test` like every other one.
 
 Repeated requests are kept: *"I changed the address twice"* is usually the whole
 bug. Anything repro could not parse is preserved in `.repro/report.md` for the
@@ -632,6 +695,24 @@ Every step also accepts `id`, `name`, `expect`, `keep`, and `save`.
 `save: { sid: $.session }` captures a value from the response for use as
 `${sid}` later; `${env.NAME}` reads the environment.
 
+In a git repository, `shell` and `agent` steps are bracketed by a snapshot of
+the dirty part of the working tree, so what a step added, modified or deleted
+is recorded on the step and assertable with `files_changed`. Evidence under
+`.repro/` is excluded.
+
+### Agent step keys
+
+| key | meaning |
+| --- | --- |
+| `run` | command to run; `input` arrives as one JSON line on stdin |
+| `input` | recorded as `trace.input` and handed to the command |
+| `trace_file` | read the trace from here instead of, or as well as, stdout |
+| `output_schema` | JSON Schema the final output must satisfy |
+| `format` | `jsonl` (default, detected) or `claude-code` |
+| `replay` | reproduction mode: exported as `REPRO_REPLAY=<path>` — see [Reproduction and replay](#reproduction-and-replay) |
+| `record` | exported as `REPRO_RECORD=<dir>` inside the run's evidence |
+| `env`, `cwd`, `timeout_ms` | as for shell steps |
+
 ### Browser actions
 
 `goto`, `click`, `fill`, `type`, `select`, `press`, `wait_for`, `wait`,
@@ -665,6 +746,7 @@ must hold.
 | `output` | agent final output: `equals`, `contains`, `matches`, `schema` |
 | `duration_ms` | how long the step took |
 | `usage` | `input_tokens`, `output_tokens`, `total_tokens` |
+| `files_changed` | substring(s) of paths a shell or agent step added, modified or deleted |
 
 ### Services
 
@@ -731,16 +813,52 @@ that are not JSON are ignored, because agents log. The whole trace is also
 readable as JSON, so `json: { $.output.status: refunded }` and
 `save: { id: $.output.order_id }` work exactly as they do on an HTTP response.
 
+Other spellings normalize onto those seven rather than adding to them:
+
+| emitted | becomes |
+| --- | --- |
+| `model.request` / `model_request`, then `model.response` / `model_response` | one `model` event with `input` and `output` |
+| `tool.call`, `tool_use` / `tool.result` | `tool_call` / `tool_result` |
+| `mcp.call`, `mcp_call` / `mcp.result`, `mcp_result` | `tool_call` / `tool_result` with `server` set (`mcp` when unnamed) |
+| `agent.step`, `agent_step` | not an event; numbers every event after it with `step` |
+
+An MCP call is a tool call with a transport, so `server` is a field, not a
+type. `model` events may carry `model` (the identifier) and every event may
+carry `step`.
+
 ### What you can match
 
 | bug | matcher |
 | --- | --- |
 | wrong tool | `trace: { tool_call: { name: refund_order } }` |
 | wrong arguments | `arguments: { amount: { greater_than: 100 } }` |
+| wrong MCP server | `tool_call: { name: read_file, server: filesystem }` |
 | missing required action | `sequence: { contains: [...], not_preceded_by: {...} }` |
 | looping | `tool_call: { name: web_search, count: { greater_than: 10 } }` |
 | cost or latency | `usage: { total_tokens: { greater_than: 50000 } }`, `duration_ms` |
 | malformed structured output | `output: { schema: { valid: false } }` |
+| edited the wrong file | `files_changed: [src/auth.ts]` |
+
+### Two layers, one run
+
+An agent trace says *the agent called `npm test`*. repro also sees the run the
+agent happened in:
+
+```
+                    AGENT SEMANTICS      model → tool_call: shell → tool_call: edit
+                                             │                  │
+────────────────────────────────────────────┼──────────────────┼────────────
+                    REAL EXECUTION           │                  │
+                                        exit code, output   files_changed
+                    git 67071a9 + repo.patch · lockfile hashes · network.json
+```
+
+The semantic events come from the agent; the physical layer comes from repro
+observing the process it spawned — exit codes, output, the working tree before
+and after, the commit and uncommitted diff the run started from. Coverage
+says which of those a run actually has. The link between the two layers is
+by step: `tool_call: edit` on the trace, `~ src/auth.ts` on the same step's
+files.
 
 Comparators are `equals`, `not_equals`, `greater_than`,
 `greater_than_or_equal`, `less_than`, `less_than_or_equal`, `contains`,
@@ -768,17 +886,56 @@ A 30% bug is reproduced. `repro establish` records that rate, `repro seal`
 freezes it, and after the fix `repro verify --repeat 500` says whether it moved
 — against the interval, not against a single lucky run.
 
-### Reproduction, not replay
+### Reproduction and replay
 
-repro runs the agent fresh every time. Replaying a recorded model output and a
-recorded tool response proves only that the recording still plays; it cannot
-tell you whether the agent would make the same bad decision again.
+repro runs the agent fresh every time. That answers *would the agent make the
+same bad decision again* — the rate, which is what `establish`, `seal` and
+`verify` measure. Replaying a recorded model output cannot answer that; it
+proves only that the recording still plays.
 
-The consequence to be aware of: the agent's tools run for real. Point the step
-at a harness whose tools are stubbed, or at a staging environment, before
-reproducing a bug whose failing step is `refund_customer`. Built-in tool
-virtualization — stub, record and replay modes with side effects captured
-rather than performed — is not implemented yet.
+Replay answers a different question: *given that decision, does the rest still
+fail*. That isolates the physical layer — the tools, the files, the
+application — from the model's sampling, and it is what `replay:` is for:
+
+```yaml
+- agent:
+    run: node agents/support.mjs
+    replay: .repro/fixtures/incident.jsonl   # reproduction mode
+    record: true                              # save what this run would replay
+```
+
+repro does not proxy the model. It exports `REPRO_REPLAY=<absolute path>`
+and `REPRO_RECORD=<dir under the run's evidence>` to the agent and the
+harness honours them — the shipped support agent takes its planner decision
+from the recording and runs its tools live. Coverage reports `model responses:
+replayed from …` when the contract was in effect, so a replayed run is never
+mistaken for a measurement. Everything else in the spec — a different model
+in `env`, a different prompt in `input`, different code in the working tree —
+is experiment mode: change one thing, run live, watch the rate.
+
+The consequence to be aware of either way: the agent's tools run for real.
+Point the step at a harness whose tools are stubbed, or at a staging
+environment, before reproducing a bug whose failing step is `refund_customer`.
+
+### Claude Code
+
+`claude -p "<prompt>" --output-format stream-json --verbose` prints a stream
+repro recognizes by shape, and the session transcripts under
+`~/.claude/projects/` have the same shape:
+
+```yaml
+- id: fix
+  agent:
+    run: claude -p "fix the failing auth test" --output-format stream-json --verbose
+    # format: claude-code   # only if detection guesses wrong
+```
+
+Assistant turns become `model` events (with the model id and usage), tool
+uses become `tool_call`, tool results `tool_result`, text `message`; MCP tools
+named `mcp__<server>__<tool>` split into `name` and `server`; the final
+`result` is the output. `repro from session.jsonl` imports one directly. This
+is the only integration repro ships, and it is a normalizer, not a dependency
+— an agent that prints the generic JSONL never touches it.
 
 ### Semantic failures
 
@@ -867,15 +1024,23 @@ behind:
 
 ```
 .repro/runs/0011/
-├── result.json       verdict, per-step observations, timings
+├── result.json       verdict, per-step observations (incl. files changed), timings,
+│                     environment fingerprint, coverage
 ├── network.json      every request and response
+├── repo.patch        the uncommitted diff the run started from (when dirty)
+├── repo.status       the dirty and untracked paths at that moment
+├── traces/NN.json    the normalized trace of each agent step
+├── recordings/       whatever a harness saved under REPRO_RECORD (absent when it saved nothing)
 ├── service.log       this run's slice of the application's output
 ├── browser.log       console messages and page errors
 ├── screenshots/      including an automatic one at the failing action
 └── trace.zip         Playwright trace (--trace)
 ```
 
-`.repro/runs/latest` always points at the most recent run.
+`.repro/runs/latest` always points at the most recent run. Every run records
+the same fingerprint the seal does — commit, dirty flag, lockfile hashes,
+runtime — so two runs can be compared on where they happened, never on
+environment variables.
 
 
 ## Try it
@@ -898,6 +1063,8 @@ node ../dist/cli.js seal                            # freeze the contract
 node ../dist/cli.js verify                          # FAIL: the bug is still there
 node ../dist/cli.js run --spec .repro/browser.yaml  # same bug through the UI
 node ../dist/cli.js run --spec .repro/agent.yaml    # an agent bug, matched on its trace
+node ../dist/cli.js run --worktree HEAD             # the same contract against another commit
+node ../dist/cli.js from .repro/runs/latest/traces/01.json --root /tmp/shop  # a trace becomes a fixture
 ```
 
 Set `FLAKY_RATE=0.7` on the example server to watch `--repeat` classify an
@@ -948,7 +1115,7 @@ a particular bug.
 ```bash
 npm install
 npm run build
-npm test          # 26 tests, including end-to-end reproduce/minimize/explain
+npm test          # unit and end-to-end: reproduce, minimize, explain, verify
 bash docs/demo.sh # regenerate the demo recording
 ```
 
